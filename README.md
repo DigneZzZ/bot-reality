@@ -18,27 +18,86 @@
 
 ## 🚀 Быстрый запуск с Docker
 
-1. Клонируйте репозиторий:
-   ```bash
-   git clone https://github.com/DigneZzZ/bot-reality.git
-   cd domain-checker-bot
+1. Убедитесь, что у вас установлены [Docker](https://docs.docker.com/get-docker/) и [Docker Compose](https://docs.docker.com/compose/install/).
+
+2. Создайте файл `docker-compose.yml` со следующим содержимым:
+   ```yaml
+   services:
+     bot:
+       image: ghcr.io/dignezzz/bot-reality:latest
+       environment:
+         - BOT_TOKEN=${BOT_TOKEN}
+         - REDIS_HOST=redis
+         - REDIS_PORT=6379
+       depends_on:
+         - redis
+       restart: unless-stopped
+       logging:
+         options:
+           max-size: "10m"
+           max-file: "3"
+     worker:
+       image: ghcr.io/dignezzz/bot-reality:latest
+       command: python worker.py
+       environment:
+         - BOT_TOKEN=${BOT_TOKEN}
+         - REDIS_HOST=redis
+         - REDIS_PORT=6379
+       depends_on:
+         - redis
+       restart: unless-stopped
+       logging:
+         options:
+           max-size: "10m"
+           max-file: "3"
+     redis:
+       image: redis:7.4.3
+       volumes:
+         - redis_data:/data
+       restart: unless-stopped
+       logging:
+         options:
+           max-size: "10m"
+           max-file: "3"
+   volumes:
+     redis_data:
    ```
 
-2. Скопируйте файл окружения и настройте токен бота:
+3. Создайте файл `.env` и добавьте токен Telegram-бота, полученный от `@BotFather`:
+   ```bash
+   echo "BOT_TOKEN=your-telegram-bot-token" > .env
+   ```
+
+4. Запустите контейнеры:
+   ```bash
+   docker compose up -d
+   ```
+
+5. Проверьте логи для подтверждения запуска:
+   ```bash
+   docker compose logs -f
+   ```
+
+## 🛠 Альтернативный запуск (для разработчиков)
+
+Если вы хотите собрать образ самостоятельно:
+
+1. Клонируйте репозиторий:
+   ```bash
+   git clone https://github.com/dignezzz/bot-reality.git
+   cd bot-reality
+   ```
+
+2. Скопируйте файл окружения:
    ```bash
    cp .env.sample .env
    nano .env
    ```
-   Укажите ваш Telegram-токен, полученный от `@BotFather`.
+   Укажите ваш Telegram-токен.
 
-3. Запустите контейнеры:
+3. Соберите и запустите контейнеры:
    ```bash
    docker compose up --build -d
-   ```
-
-4. Проверьте логи для подтверждения запуска:
-   ```bash
-   docker compose logs -f
    ```
 
 ## 🛠 Локальный запуск без Docker
@@ -82,7 +141,7 @@ REDIS_PORT=6379
 
 ## 📦 Контейнеры
 
-Проект использует три сервиса в `docker-compose.yml`:
+Проект использует три сервиса:
 
 - **`bot`**: Telegram-бот, обрабатывающий команды пользователей и ставящий задачи в очередь.
 - **`worker`**: Обрабатывает очередь, выполняет проверки доменов и отправляет результаты.
@@ -132,7 +191,7 @@ sudo sysctl -p
 
 ## 🛠 CI/CD
 
-Проект поддерживает автоматическую сборку Docker-образов через GitHub Actions. Конфигурация находится в `.github/workflows/docker.yml`.
+Docker-образы автоматически собираются и публикуются в GitHub Container Registry (`ghcr.io/dignezzz/bot-reality:latest`) через GitHub Actions. Конфигурация находится в `.github/workflows/docker.yml`.
 
 ## 🔒 Автор
 
