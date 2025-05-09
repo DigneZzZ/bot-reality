@@ -1,4 +1,3 @@
-
 import asyncio
 from aiogram import Bot, Dispatcher, types
 import os
@@ -23,7 +22,6 @@ user_requests = defaultdict(list)
 user_violations = {}
 
 def extract_domain(text: str):
-    # Если это URL
     if text.startswith("http://") or text.startswith("https://"):
         try:
             parsed = urlparse(text)
@@ -31,7 +29,6 @@ def extract_domain(text: str):
                 return parsed.hostname
         except:
             return None
-    # Если это домен:порт
     if re.match(r"^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$", text):
         return text
     return None
@@ -47,6 +44,8 @@ def rate_limited(user_id):
 def get_penalty(user_id):
     record = user_violations.get(user_id, {"count": 0, "until": 0})
     now = time()
+    if record["count"] < 5:
+        return 0, False
     if now < record["until"]:
         return int(record["until"] - now), True
     return 0, False
@@ -54,21 +53,24 @@ def get_penalty(user_id):
 def register_violation(user_id):
     record = user_violations.get(user_id, {"count": 0, "until": 0})
     record["count"] += 1
-    duration = [300, 7200, 86400, 2592000]  # 5m, 2h, 1d, 30d
-    timeout = duration[min(record["count"] - 1, len(duration) - 1)]
-    record["until"] = time() + timeout
+    duration = [60, 300, 900, 3600]  # 1m, 5m, 15m, 1h
+    if record["count"] >= 5:
+        stage = record["count"] - 5
+        timeout = duration[min(stage, len(duration) - 1)]
+        record["until"] = time() + timeout
     user_violations[user_id] = record
-    return timeout
+    return int(record["until"] - time()) if record["count"] >= 5 else 0
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я бот для проверки доменов на пригодность для прокси и Reality."
-        "Отправь домен (например, `example.com`) или используй команду:"
-        "/check <домен>"
-        "Дополнительно:"
-        "/ping — проверить, что бот работает"
-        "/stats — статистика очереди и кэша",
+        """👋 Привет! Я бот для проверки доменов на пригодность для прокси и Reality.
+
+Отправь домен (например, `example.com`) или используй команду:
+/check <домен>
+
+/ping — проверить, что бот работает
+/stats — статистика очереди и кэша""",
         parse_mode="Markdown"
     )
 
@@ -80,8 +82,9 @@ async def cmd_ping(message: types.Message):
 async def cmd_stats(message: types.Message):
     qlen = await r.llen("domain_check_queue")
     keys = await r.keys("result:*")
-    await message.reply(f"📊 В очереди: {qlen} доменов
-🧠 В кэше: {len(keys)} доменов")
+    await message.reply(
+        f"📊 В очереди: {qlen} доменов\n🧠 В кэше: {len(keys)} доменов"
+    )
 
 @dp.message_handler(commands=["check"])
 async def cmd_check(message: types.Message):
@@ -99,7 +102,7 @@ async def handle_domain_logic(message: types.Message, input_text: str):
     user_id = message.from_user.id
     penalty, active = get_penalty(user_id)
     if active:
-        return  # игнорируем
+        return
 
     if rate_limited(user_id):
         await message.reply("🚫 Слишком много запросов. Не более 10 проверок за 30 секунд.")
@@ -118,9 +121,7 @@ async def handle_domain_logic(message: types.Message, input_text: str):
 
     cached = await r.get(f"result:{domain}")
     if cached:
-        await message.answer(f"⚡ Результат из кэша:
-
-{cached}")
+        await message.answer(f"⚡ Результат из кэша:\n\n{cached}")
         return
 
     await enqueue(domain, user_id)
