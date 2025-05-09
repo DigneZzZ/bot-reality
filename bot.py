@@ -115,7 +115,7 @@ async def cmd_start(message: types.Message):
         "/check <домен> — Проверить домен (краткий отчёт, например, <code>/check example.com</code>)\n"
         "/full <домен> — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
         "/ping — Убедиться, что бот работает\n"
-        "/history — Показать последние проверки\n\n"
+        "/history — Показать последние 10 проверок\n\n"
         "📩 Можно отправить несколько доменов (через запятую или перенос строки), например:\n"
         "<code>example.com, google.com</code>\n"
         "🚀 Выбери действие ниже!"
@@ -133,13 +133,15 @@ async def cmd_history(message: types.Message):
     user_id = message.from_user.id
     r = await get_redis()
     try:
-        history = await r.lrange(f"history:{user_id}", 0, -1)
+        history = await r.lrange(f"history:{user_id}", 0, 9)  # Только последние 10 записей
         if not history:
-            await message.reply("📜 История проверок пуста.")
+            await message.reply("📜 Ваша история проверок пуста.")
             return
-        response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
+        response = "📜 <b>Ваши последние проверки (максимум 10):</b>\n"
+        for i, entry in enumerate(history, 1):
+            response += f"{i}. {entry}\n"
         await message.reply(response)
-        logging.info(f"User {user_id} viewed history")
+        logging.info(f"User {user_id} viewed history with {len(history)} entries")
     except Exception as e:
         logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при получении истории.")
@@ -176,13 +178,15 @@ async def process_callback(callback_query: types.CallbackQuery):
     elif callback_query.data == "history":
         r = await get_redis()
         try:
-            history = await r.lrange(f"history:{user_id}", 0, -1)
+            history = await r.lrange(f"history:{user_id}", 0, 9)  # Только последние 10 записей
             if not history:
-                await callback_query.message.reply("📜 История проверок пуста.")
+                await callback_query.message.reply("📜 Ваша история проверок пуста.")
             else:
-                response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
+                response = "📜 <b>Ваши последние проверки (максимум 10):</b>\n"
+                for i, entry in enumerate(history, 1):
+                    response += f"{i}. {entry}\n"
                 await callback_query.message.reply(response)
-            logging.info(f"User {user_id} viewed history via callback")
+            logging.info(f"User {user_id} viewed history via callback with {len(history)} entries")
         except Exception as e:
             logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
             await callback_query.message.reply("❌ Ошибка при получении истории.")
@@ -190,8 +194,21 @@ async def process_callback(callback_query: types.CallbackQuery):
             await r.aclose()
     elif callback_query.data.startswith("full_report:"):
         domain = callback_query.data.split(":", 1)[1]
-        await handle_domain_logic(callback_query.message, domain, short_mode=False)
-        logging.info(f"User {user_id} requested full report for {domain} via callback")
+        r = await get_redis()
+        try:
+            cached = await r.get(f"result:{domain}")
+            if cached:
+                lines = cached.split("\n")
+                full_result = "\n".join(lines)  # Возвращаем полный отчёт из кэша
+                await callback_query.message.answer(f"⚡ Полный отчёт для {domain}:\n\n{full_result}")
+            else:
+                await enqueue(domain, user_id, short_mode=False)
+                await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт.")
+        except Exception as e:
+            logging.error(f"Failed to process full report for {domain} by user {user_id}: {str(e)}")
+            await callback_query.message.answer(f"❌ Ошибка: {str(e)}")
+        finally:
+            await r.aclose()
     await callback_query.answer()
 
 async def handle_domain_logic(message: types.Message, input_text: str, short_mode: bool = True):
