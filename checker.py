@@ -1,77 +1,134 @@
+
+import socket
+import ssl
+import time
+import requests
 import subprocess
-import json
-import re
+import whois
+from datetime import datetime
+import idna
 
-def run(cmd):
-    return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
-
-def get_ipinfo(ip):
+def resolve_dns(domain):
     try:
-        data = run(f"curl -s https://ipinfo.io/{ip}/json")
-        parsed = json.loads(data)
-        org = parsed.get("org", "N/A")
-        city = parsed.get("city", "N/A")
-        region = parsed.get("region", "N/A")
-        country = parsed.get("country", "N/A")
-        return f"📍 IPinfo: {country} / {region} / {city}\n🏢 {org}"
-    except:
-        return "📍 IPinfo: ошибка получения данных"
+        ip = socket.gethostbyname(domain)
+        return ip
+    except Exception:
+        return None
 
-def get_whois_asn(ip):
-    whois_data = run(f"whois {ip}")
-    match = re.search(r"origin\s*:\s*(AS\d+)", whois_data, re.IGNORECASE)
-    org = re.search(r"(OrgName|org-name)\s*:\s*(.+)", whois_data, re.IGNORECASE)
-    asn = match.group(1) if match else "N/A"
-    org_name = org.group(2).strip() if org else "N/A"
-    return f"🛰️ WHOIS: {asn} / {org_name}"
+def get_ping(ip):
+    ping_methods = [
+        ["ping", "-c", "1", "-W", "1", ip],
+        ["ping6", "-c", "1", "-W", "1", ip],
+        ["ping", "-n", "-c", "1", ip],
+    ]
+    for cmd in ping_methods:
+        try:
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=2).decode()
+            if "time=" in output:
+                time_part = output.split("time=")[-1].split(" ")[0]
+                return f"🟢 Ping: ~{time_part}"
+        except Exception:
+            continue
+    return "❌ Ping: ошибка запроса"
 
-def run_check(domain):
-    port = "443"
-    if ":" in domain:
-        domain, port = domain.split(":")
+def get_tls_info(domain, port):
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
+            s.settimeout(3)
+            s.connect((domain, port))
+            cert = s.getpeercert()
+            tls_version = s.version()
+            cipher = s.cipher()
+            expire_str = cert["notAfter"]
+            expire_date = datetime.strptime(expire_str, "%b %d %H:%M:%S %Y %Z")
+            days_left = (expire_date - datetime.utcnow()).days
+            return [
+                f"✅ {tls_version} поддерживается",
+                f"✅ {cipher[0]} используется",
+                f"⏳ TLS сертификат истекает через {days_left} дн."
+            ]
+    except Exception:
+        return ["❌ TLS: не удалось подключиться"]
 
-    output = [f"<b>🔍 Проверка: {domain}:{port}</b>\n"]
+def get_http_info(domain):
+    try:
+        url = f"https://{domain}"
+        start = time.time()
+        resp = requests.get(url, timeout=5)
+        duration = time.time() - start
+        lines = []
+        if resp.raw.version == 2:
+            lines.append("✅ HTTP/2 поддерживается")
+        if "alt-svc" in resp.headers and "h3" in resp.headers["alt-svc"]:
+            lines.append("✅ HTTP/3 (h3) поддерживается")
+        if "server" in resp.headers:
+            lines.append(f"🔧 Server: {resp.headers['server']}")
+        lines.append(f"⏱️ Время ответа (TTFB): {duration:.2f} сек")
+        if resp.is_redirect or resp.history:
+            lines.append(f"🔁 Redirect: {resp.url}")
+        return lines
+    except Exception:
+        return ["❌ HTTP: ошибка подключения"]
 
-    ip_v4 = run(f"dig +short A {domain}")
-    ip_v6 = run(f"dig +short AAAA {domain}")
+def get_domain_whois(domain):
+    try:
+        w = whois.whois(domain)
+        exp = w.expiration_date
+        if isinstance(exp, list):
+            exp = exp[0]
+        return f"📆 WHOIS срок действия: {exp.isoformat()}"
+    except Exception:
+        return "❌ WHOIS: не удалось получить данные"
 
-    if not ip_v4 and not ip_v6:
-        output.append("❌ DNS: не разрешается")
+def get_ip_info(ip):
+    try:
+        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5).json()
+        loc = r.get("city", "") + ", " + r.get("region", "") + ", " + r.get("country", "")
+        org = r.get("org", "N/A")
+        asn = org.split()[0] if " " in org else org
+        name = " ".join(org.split()[1:]) if " " in org else "N/A"
+        return [f"📍 IPinfo: {loc}", f"🏢 {org}", f"🛰️ WHOIS: {asn} / {name}"]
+    except Exception:
+        return ["❌ IPinfo: ошибка запроса"]
+
+def run_check(domain_port: str):
+    if ":" in domain_port:
+        domain, port = domain_port.split(":")
+        port = int(port)
     else:
-        if ip_v4:
-            output.append(f"✅ A: {ip_v4.splitlines()[0]}")
-        if ip_v6:
-            output.append(f"✅ AAAA: {ip_v6.splitlines()[0]}")
+        domain = domain_port
+        port = 443
 
-    ip = ip_v4.splitlines()[0] if ip_v4 else ip_v6.splitlines()[0] if ip_v6 else None
+    domain = idna.encode(domain).decode("utf-8")
+    result = []
+
+    result.append(f"🔍 Проверка: {domain}:{port}\n")
+
+    ip = resolve_dns(domain)
+    result.append("🌐 DNS")
+    result.append(f"✅ A: {ip}" if ip else "❌ DNS: не разрешается")
+
+    result.append("\n🌎 IP и ASN")
     if ip:
-        output.append("")
-        output.append(get_ipinfo(ip))
-        output.append(get_whois_asn(ip))
-
-    tls_out = run(f"echo | timeout 5 openssl s_client -connect {domain}:{port} -servername {domain} -tls1_3 2>/dev/null")
-    if "TLSv1.3" in tls_out:
-        output.append("✅ TLS 1.3 поддерживается")
-        if "X25519" in tls_out:
-            output.append("✅ X25519 используется")
+        result += get_ip_info(ip)
+        result.append(get_ping(ip))
     else:
-        output.append("❌ TLS 1.3 не поддерживается")
+        result.append("❌ IP: отсутствует")
 
-    curl_out = run(f"curl -sIk --max-time 8 https://{domain}:{port}")
-    if curl_out:
-        if "HTTP/2" in curl_out:
-            output.append("✅ HTTP/2 поддерживается")
-        else:
-            output.append("❌ HTTP/2 не поддерживается")
+    result.append("\n🔒 TLS")
+    result += get_tls_info(domain, port)
 
-        if "alt-svc: h3" in curl_out.lower():
-            output.append("✅ HTTP/3 (h3) поддерживается")
-        else:
-            output.append("❌ HTTP/3 не поддерживается")
+    result.append("\n🌐 HTTP")
+    result += get_http_info(domain)
 
-        if "location:" in curl_out.lower():
-            output.append("ℹ️ Перенаправление включено")
+    result.append("\n📄 WHOIS домена")
+    result.append(get_domain_whois(domain))
+
+    result.append("\n🛰 Оценка пригодности")
+    if ip and "cloudflare" in "".join(result).lower():
+        result.append("❌ Не пригоден: обнаружен CDN")
     else:
-        output.append("❌ HTTP: нет ответа")
+        result.append("✅ Пригоден для Reality")
 
-    return "\n".join(output)
+    return "\n".join(result)
