@@ -2,7 +2,7 @@ import asyncio
 import os
 from aiogram import Bot
 from checker import run_check
-from queue import dequeue
+from redis_queue import dequeue
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
