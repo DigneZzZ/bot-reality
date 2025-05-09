@@ -33,12 +33,19 @@ async def process_domain(user_id: int, domain: str, short_mode: bool = False):
                 line for line in lines
                 if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности", "✅", "🟢", "❌"])
             )
-            result = short_result if short_result.strip() else result
-            await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain))
+            if short_result.strip():
+                await bot.send_message(user_id, short_result, reply_markup=get_full_report_button(domain))
+                async with await get_redis() as r:
+                    await r.setex(f"result:{domain}", 86400, short_result)
+            else:
+                await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain))
+                async with await get_redis() as r:
+                    await r.setex(f"result:{domain}", 86400, result)
         else:
             await bot.send_message(user_id, result)
+            async with await get_redis() as r:
+                await r.setex(f"result:{domain}", 86400, result)
         async with await get_redis() as r:
-            await r.setex(f"result:{domain}", 86400, result)
             history_key = f"history:{user_id}"
             await r.lpush(history_key, f"{domain}: {result.splitlines()[0]}")
             await r.ltrim(history_key, 0, 9)  # Храним последние 10 записей
