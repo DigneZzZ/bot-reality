@@ -7,6 +7,7 @@ import ping3
 import whois
 from datetime import datetime
 import logging
+import dns.resolver
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, filename="checker.log", format="%(asctime)s - %(levelname)s - %(message)s")
@@ -15,7 +16,7 @@ CDN_PATTERNS = [
     "cloudflare", "akamai", "fastly", "incapsula", "imperva", "sucuri", "stackpath",
     "cdn77", "edgecast", "keycdn", "azure", "tencent", "alibaba", "aliyun", "bunnycdn",
     "arvan", "g-core", "mail.ru", "mailru", "vk.com", "vk", "limelight", "lumen",
-    "level3", "centurylink", "cloudfront", "verizon"
+    "level3", "centurylink", "cloudfront", "verizon", "google", "gws", "googlecloud"
 ]
 
 WAF_FINGERPRINTS = [
@@ -27,9 +28,11 @@ FINGERPRINTS = {
     "apache": "Apache",
     "caddy": "Caddy",
     "iis": "Microsoft IIS",
+    "gws": "Google Web Server",
 }
 
 def resolve_dns(domain):
+    """Разрешает DNS для домена, возвращает IPv4-адрес."""
     try:
         return socket.gethostbyname(domain)
     except Exception as e:
@@ -37,6 +40,7 @@ def resolve_dns(domain):
         return None
 
 def get_ping(ip, timeout=1):
+    """Проверяет пинг до IP-адреса."""
     try:
         result = ping3.ping(ip, timeout=timeout, unit="ms")
         if result is not None:
@@ -47,6 +51,7 @@ def get_ping(ip, timeout=1):
         return None
 
 def get_tls_info(domain, port, timeout=5):
+    """Проверяет TLS: версию, шифр, срок действия сертификата."""
     info = {"tls": None, "cipher": None, "expires_days": None, "error": None}
     try:
         ctx = ssl.create_default_context()
@@ -63,8 +68,9 @@ def get_tls_info(domain, port, timeout=5):
         logging.error(f"TLS check failed for {domain}:{port}: {str(e)}")
     return info
 
-def get_http_info(domain, timeout=10.0):
-    info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None, "error": None}
+def get_http_info(domain, timeout=15.0):
+    """Проверяет HTTP: HTTP/2, HTTP/3, TTFB, редиректы, сервер."""
+    info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None, "error": None, "headers": {}}
     try:
         url = f"https://{domain}"
         with httpx.Client(http2=True, timeout=timeout) as client:
@@ -72,13 +78,13 @@ def get_http_info(domain, timeout=10.0):
             resp = client.get(url, follow_redirects=True)
             duration = time.time() - start
             info["http2"] = resp.http_version == "HTTP/2"
-            # Проверка HTTP/3 через alt-svc
             alt_svc = resp.headers.get("alt-svc", "")
             info["http3"] = any("h3" in svc.lower() for svc in alt_svc.split(",") if svc.strip())
             info["server"] = resp.headers.get("server", "N/A")
             info["ttfb"] = duration
             if resp.history:
                 info["redirect"] = str(resp.url)
+            info["headers"] = dict(resp.headers)
     except ImportError as e:
         info["error"] = "HTTP/2 support requires 'h2' package. Install httpx with `pip install httpx[http2]`."
         logging.error(f"HTTP check failed for {domain}: {str(e)}")
@@ -88,6 +94,7 @@ def get_http_info(domain, timeout=10.0):
     return info
 
 def get_domain_whois(domain):
+    """Проверяет WHOIS: срок действия домена."""
     try:
         w = whois.whois(domain)
         exp = w.expiration_date
@@ -101,6 +108,7 @@ def get_domain_whois(domain):
         return None
 
 def get_ip_info(ip, timeout=5):
+    """Получает геолокацию и ASN для IP."""
     try:
         r = requests.get(f"http://ip-api.com/json/{ip}", timeout=timeout).json()
         loc = f"{r.get('countryCode')} / {r.get('regionName')} / {r.get('city')}"
@@ -111,6 +119,7 @@ def get_ip_info(ip, timeout=5):
         return "N/A", "N/A"
 
 def scan_ports(ip, ports=[80, 443, 8443], timeout=1):
+    """Сканирует указанные порты на IP."""
     results = []
     for port in ports:
         try:
@@ -121,24 +130,42 @@ def scan_ports(ip, ports=[80, 443, 8443], timeout=1):
     return results
 
 def check_spamhaus(ip):
+    """Проверяет, находится ли IP в чёрном списке Spamhaus."""
     try:
         rev = ".".join(reversed(ip.split("."))) + ".zen.spamhaus.org"
-        result = socket.gethostbyname(rev)
-        return f"⚠️ В списке Spamhaus (код: {result})"
-    except socket.gaierror:
+        resolver = dns.resolver.Resolver()
+        answers = resolver.resolve(rev, "A")
+        for rdata in answers:
+            result = str(rdata)
+            # Spamhaus возвращает адреса в диапазоне 127.0.0.2–127.0.0.11
+            if result.startswith("127.0.0.") and 2 <= int(result.split(".")[-1]) <= 11:
+                logging.info(f"Spamhaus check for {ip}: listed with code {result}")
+                return f"⚠️ В списке Spamhaus (код: {result})"
+        logging.info(f"Spamhaus check for {ip}: not listed")
+        return "✅ Не найден в Spamhaus"
+    except dns.resolver.NXDOMAIN:
+        logging.info(f"Spamhaus check for {ip}: not listed")
         return "✅ Не найден в Spamhaus"
     except Exception as e:
         logging.error(f"Spamhaus check failed for {ip}: {str(e)}")
         return "❌ Spamhaus: ошибка"
 
-def detect_cdn(text):
-    text = text.lower() if isinstance(text, str) else ''
+def detect_cdn(http_info, asn):
+    """Проверяет наличие CDN на основе заголовков, ASN и других признаков."""
+    # Проверка заголовков
+    headers_str = " ".join(f"{k}:{v}" for k, v in http_info.get("headers", {}).items()).lower()
+    server = http_info.get("server", "").lower()
+    text = f"{server} {headers_str}"
     for pat in CDN_PATTERNS:
         if pat in text:
             return pat
+    # Проверка ASN (Google: AS15169)
+    if "AS15169" in asn:
+        return "google"
     return None
 
 def detect_waf(text):
+    """Проверяет наличие WAF на основе заголовка Server."""
     text = text.lower() if isinstance(text, str) else ''
     for pat in WAF_FINGERPRINTS:
         if pat in text:
@@ -146,13 +173,15 @@ def detect_waf(text):
     return "🟢 WAF не обнаружен"
 
 def fingerprint_server(text):
+    """Определяет тип сервера на основе заголовка Server."""
     text = text.lower() if isinstance(text, str) else ''
     for key, name in FINGERPRINTS.items():
         if key in text:
             return f"🧾 Сервер: {name}"
     return "🧾 Сервер: неизвестен"
 
-def run_check(domain_port: str, ping_threshold=50, http_timeout=10.0, port_timeout=2):
+def run_check(domain_port: str, ping_threshold=50, http_timeout=15.0, port_timeout=2):
+    """Выполняет полную проверку домена."""
     if ":" in domain_port:
         domain, port = domain_port.split(":")
         port = int(port)
@@ -204,9 +233,9 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=10.0, port_timeo
     report.append(f"📆 Срок действия: {whois_exp}" if whois_exp else "❌ WHOIS: ошибка")
 
     report.append("\n🛰 Оценка пригодности")
-    summary = " ".join(str(s) for s in report if isinstance(s, str)).lower()
-    if detect_cdn(summary):
-        report.append("❌ Не пригоден: CDN обнаружен")
+    cdn = detect_cdn(http, asn)
+    if cdn:
+        report.append(f"❌ Не пригоден: CDN обнаружен ({cdn.capitalize()})")
     elif not http["http2"]:
         report.append("❌ Не пригоден: HTTP/2 отсутствует")
     elif tls["tls"] not in ["TLSv1.3", "TLS 1.3"]:
