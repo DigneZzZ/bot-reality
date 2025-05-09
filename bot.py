@@ -44,6 +44,8 @@ user_requests = defaultdict(list)
 user_violations = {}
 
 def extract_domain(text: str):
+    # Удаляем порт, если указан (например, oogle.com:443 → oogle.com)
+    text = re.sub(r':\d+$', '', text.strip())
     if text.startswith("http://") or text.startswith("https://"):
         try:
             parsed = urlparse(text)
@@ -51,7 +53,8 @@ def extract_domain(text: str):
                 return parsed.hostname
         except:
             return None
-    if re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]{0,253}[a-zA-Z0-9](:[0-9]{1,5})?$", text):
+    # Проверяем, является ли строка валидным доменом
+    if re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]{0,253}[a-zA-Z0-9]$", text):
         return text
     return None
 
@@ -127,6 +130,9 @@ async def cmd_history(message: types.Message):
             return
         response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
         await message.reply(response)
+    except Exception as e:
+        logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
+        await message.reply("❌ Ошибка при получении истории.")
     finally:
         await r.aclose()
 
@@ -142,7 +148,11 @@ async def cmd_check(message: types.Message):
 
 @router.message()
 async def handle_domain(message: types.Message):
-    await handle_domain_logic(message, message.text.strip(), short_mode=True)
+    text = message.text.strip()
+    if not text or extract_domain(text) is None:
+        await message.reply("⛔ Укажи валидный домен, например: example.com")
+        return
+    await handle_domain_logic(message, text, short_mode=True)
 
 @router.callback_query()
 async def process_callback(callback_query: types.CallbackQuery):
@@ -160,6 +170,9 @@ async def process_callback(callback_query: types.CallbackQuery):
             else:
                 response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
                 await callback_query.message.reply(response)
+        except Exception as e:
+            logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
+            await callback_query.message.reply("❌ Ошибка при получении истории.")
         finally:
             await r.aclose()
     await callback_query.answer()
@@ -193,7 +206,8 @@ async def handle_domain_logic(message: types.Message, input_text: str, short_mod
             if extracted:
                 valid_domains.append(extracted)
             else:
-                await message.reply(f"⚠️ {domain} не является доменом, пропущен.")
+                await message.reply(f"⚠️ {domain} не является валидным доменом, пропущен.")
+                logging.warning(f"Invalid domain input: {domain} by user {user_id}")
         if not valid_domains:
             timeout = register_violation(user_id)
             await message.reply(f"❌ Ни один домен не распознан. Пользователь ограничен на {timeout//60} минут.")
@@ -206,14 +220,16 @@ async def handle_domain_logic(message: types.Message, input_text: str, short_mod
                     lines = cached.split("\n")
                     cached = "\n".join(
                         line for line in lines
-                        if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности"])
+                        if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности", "✅", "🟢", "❌"])
                     )
                 await message.answer(f"⚡ Результат из кэша для {domain}:\n\n{cached}")
+                logging.info(f"Returned cached result for {domain} to user {user_id}")
             else:
                 await enqueue(domain, user_id, short_mode=short_mode)
                 await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
+                logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
     except Exception as e:
-        logging.error(f"Failed to process domains: {str(e)}")
+        logging.error(f"Failed to process domains for user {user_id}: {str(e)}")
         await message.reply(f"❌ Ошибка: {str(e)}")
     finally:
         await r.aclose()
