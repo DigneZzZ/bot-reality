@@ -8,15 +8,16 @@ import whois
 from datetime import datetime
 import logging
 import dns.resolver
+import re
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, filename="checker.log", format="%(asctime)s - %(levelname)s - %(message)s")
 
 CDN_PATTERNS = [
     "cloudflare", "akamai", "fastly", "incapsula", "imperva", "sucuri", "stackpath",
     "cdn77", "edgecast", "keycdn", "azure", "tencent", "alibaba", "aliyun", "bunnycdn",
     "arvan", "g-core", "mail.ru", "mailru", "vk.com", "vk", "limelight", "lumen",
-    "level3", "centurylink", "cloudfront", "verizon", "google", "gws", "googlecloud"
+    "level3", "centurylink", "cloudfront", "verizon", "google", "gws", "googlecloud",
+    "x-google", "via: 1.1 google"
 ]
 
 WAF_FINGERPRINTS = [
@@ -68,7 +69,7 @@ def get_tls_info(domain, port, timeout=5):
         logging.error(f"TLS check failed for {domain}:{port}: {str(e)}")
     return info
 
-def get_http_info(domain, timeout=15.0):
+def get_http_info(domain, timeout=20.0):
     """Проверяет HTTP: HTTP/2, HTTP/3, TTFB, редиректы, сервер."""
     info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None, "error": None, "headers": {}}
     try:
@@ -85,6 +86,7 @@ def get_http_info(domain, timeout=15.0):
             if resp.history:
                 info["redirect"] = str(resp.url)
             info["headers"] = dict(resp.headers)
+            logging.info(f"HTTP headers for {domain}: {info['headers']}")
     except ImportError as e:
         info["error"] = "HTTP/2 support requires 'h2' package. Install httpx with `pip install httpx[http2]`."
         logging.error(f"HTTP check failed for {domain}: {str(e)}")
@@ -160,7 +162,7 @@ def detect_cdn(http_info, asn):
         if pat in text:
             return pat
     # Проверка ASN (Google: AS15169)
-    if "AS15169" in asn:
+    if asn and re.search(r"\b15169\b", asn):
         return "google"
     return None
 
@@ -180,7 +182,7 @@ def fingerprint_server(text):
             return f"🧾 Сервер: {name}"
     return "🧾 Сервер: неизвестен"
 
-def run_check(domain_port: str, ping_threshold=50, http_timeout=15.0, port_timeout=2):
+def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeout=2):
     """Выполняет полную проверку домена."""
     if ":" in domain_port:
         domain, port = domain_port.split(":")
@@ -227,13 +229,14 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=15.0, port_timeo
     report.append(f"🔁 Redirect: {http['redirect']}" if http["redirect"] else "🔁 Без редиректа")
     report.append(fingerprint_server(http.get("server", "")))
     report.append(detect_waf(http.get("server", "")))
+    cdn = detect_cdn(http, asn)
+    report.append(f"⚠️ CDN обнаружен: {cdn.capitalize()}" if cdn else "🟢 CDN не обнаружен")
 
     report.append("\n📄 WHOIS")
     whois_exp = get_domain_whois(domain)
     report.append(f"📆 Срок действия: {whois_exp}" if whois_exp else "❌ WHOIS: ошибка")
 
     report.append("\n🛰 Оценка пригодности")
-    cdn = detect_cdn(http, asn)
     if cdn:
         report.append(f"❌ Не пригоден: CDN обнаружен ({cdn.capitalize()})")
     elif not http["http2"]:
