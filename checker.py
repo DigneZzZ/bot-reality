@@ -16,10 +16,20 @@ CDN_PATTERNS = [
     "level3", "centurylink", "cloudfront", "verizon"
 ]
 
+WAF_FINGERPRINTS = [
+    "cloudflare", "imperva", "sucuri", "incapsula", "akamai", "barracuda"
+]
+
+FINGERPRINTS = {
+    "nginx": "NGINX",
+    "apache": "Apache",
+    "caddy": "Caddy",
+    "iis": "Microsoft IIS",
+}
+
 def resolve_dns(domain):
     try:
-        ip = socket.gethostbyname(domain)
-        return ip
+        return socket.gethostbyname(domain)
     except Exception:
         return None
 
@@ -79,15 +89,31 @@ def get_domain_whois(domain):
 
 def get_ip_info(ip):
     try:
-        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5).json()
-        city = r.get("city", "")
-        region = r.get("region", "")
-        country = r.get("country", "")
-        loc = f"{country} / {region} / {city}"
-        org = r.get("org", "N/A")
-        return loc, org
+        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=5).json()
+        loc = f"{r.get('countryCode')} / {r.get('regionName')} / {r.get('city')}"
+        asn = r.get("as", "N/A")
+        return loc, asn
     except Exception:
         return "N/A", "N/A"
+
+def scan_ports(ip):
+    ports = [80, 443, 8443]
+    results = []
+    for port in ports:
+        try:
+            with socket.create_connection((ip, port), timeout=1):
+                results.append(f"🟢 TCP {port} открыт")
+        except:
+            results.append(f"🔴 TCP {port} закрыт")
+    return results
+
+def check_spamhaus(ip):
+    try:
+        rev = ".".join(reversed(ip.split("."))) + ".zen.spamhaus.org"
+        socket.gethostbyname(rev)
+        return "⚠️ В списке Spamhaus"
+    except socket.gaierror:
+        return "✅ Не найден в Spamhaus"
 
 def detect_cdn(text):
     text = text.lower()
@@ -95,6 +121,20 @@ def detect_cdn(text):
         if pat in text:
             return pat
     return None
+
+def detect_waf(text):
+    text = text.lower()
+    for pat in WAF_FINGERPRINTS:
+        if pat in text:
+            return f"🛡 Обнаружен WAF: {pat.capitalize()}"
+    return "🟢 WAF не обнаружен"
+
+def fingerprint_server(text):
+    text = text.lower()
+    for key, name in FINGERPRINTS.items():
+        if key in text:
+            return f"🧾 Сервер: {name}"
+    return "🧾 Сервер: неизвестен"
 
 def run_check(domain_port: str):
     if ":" in domain_port:
@@ -105,27 +145,25 @@ def run_check(domain_port: str):
         port = 443
 
     domain = idna.encode(domain).decode("utf-8")
-    report = []
-    report.append(f"🔍 Проверка: {domain}:{port}\n")
+    report = [f"🔍 Проверка: {domain}:{port}\n"]
 
     ip = resolve_dns(domain)
     report.append("🌐 DNS")
-    if ip:
-        report.append(f"✅ A: {ip}")
-    else:
-        report.append("❌ DNS: не разрешается")
+    report.append(f"✅ A: {ip}" if ip else "❌ DNS: не разрешается")
+    if not ip:
         return "\n".join(report)
 
-    report.append("\n🌎 IP и ASN")
-    ip_loc, ip_org = get_ip_info(ip)
-    report.append(f"📍 IPinfo: {ip_loc}")
-    report.append(f"🏢 {ip_org}")
+    report.append("\n📡 Скан портов")
+    report += scan_ports(ip)
+
+    report.append("\n🌍 География и ASN")
+    loc, asn = get_ip_info(ip)
+    report.append(f"📍 IP: {loc}")
+    report.append(f"🏢 ASN: {asn}")
+    report.append(check_spamhaus(ip))
 
     ping_ms = get_ping(ip)
-    if ping_ms is not None:
-        report.append(f"🟢 Ping: ~{ping_ms:.1f} ms")
-    else:
-        report.append("❌ Ping: ошибка запроса")
+    report.append(f"🟢 Ping: ~{ping_ms:.1f} ms" if ping_ms else "❌ Ping: ошибка")
 
     report.append("\n🔒 TLS")
     tls = get_tls_info(domain, port)
@@ -141,33 +179,26 @@ def run_check(domain_port: str):
     http = get_http_info(domain)
     report.append("✅ HTTP/2 поддерживается" if http["http2"] else "❌ HTTP/2 не поддерживается")
     report.append("✅ HTTP/3 (h3) поддерживается" if http["http3"] else "❌ HTTP/3 не поддерживается")
-    report.append(f"🔧 Server: {http['server']}")
-    if http["ttfb"]:
-        report.append(f"⏱️ Время ответа (TTFB): {http['ttfb']:.2f} сек")
-    if http["redirect"]:
-        report.append(f"🔁 Redirect: {http['redirect']}")
+    report.append(f"⏱️ TTFB: {http['ttfb']:.2f} сек" if http["ttfb"] else "⏱️ TTFB: неизвестно")
+    report.append(f"🔁 Redirect: {http['redirect']}" if http["redirect"] else "🔁 Без редиректа")
+    report.append(fingerprint_server(http.get("server", "")))
+    report.append(detect_waf(http.get("server", "")))
 
-    report.append("\n📄 WHOIS домена")
+    report.append("\n📄 WHOIS")
     whois_exp = get_domain_whois(domain)
-    if whois_exp:
-        report.append(f"📆 WHOIS срок действия: {whois_exp}")
-    else:
-        report.append("❌ WHOIS: ошибка получения данных")
+    report.append(f"📆 Срок действия: {whois_exp}" if whois_exp else "❌ WHOIS: ошибка")
 
     report.append("\n🛰 Оценка пригодности")
-    summary_text = " ".join(report).lower()
-    verdict = []
-
-    if detect_cdn(summary_text):
-        verdict.append("❌ Не пригоден: обнаружен CDN")
+    summary = " ".join(report).lower()
+    if detect_cdn(summary):
+        report.append("❌ Не пригоден: CDN обнаружен")
     elif not http["http2"]:
-        verdict.append("❌ Не пригоден: HTTP/2 отсутствует")
+        report.append("❌ Не пригоден: HTTP/2 отсутствует")
     elif tls["tls"] not in ["TLSv1.3", "TLS 1.3"]:
-        verdict.append("❌ Не пригоден: TLS 1.3 отсутствует")
+        report.append("❌ Не пригоден: TLS 1.3 отсутствует")
     elif ping_ms and ping_ms >= 8:
-        verdict.append("❌ Не пригоден: слишком высокий пинг")
+        report.append("❌ Не пригоден: высокий пинг")
     else:
-        verdict.append("✅ Пригоден для Reality")
+        report.append("✅ Пригоден для Reality")
 
-    report.append("\n".join(verdict))
     return "\n".join(report)
