@@ -116,21 +116,21 @@ def check_spamhaus(ip):
         return "✅ Не найден в Spamhaus"
 
 def detect_cdn(text):
-    text = text.lower()
+    text = text.lower() if isinstance(text, str) else ''
     for pat in CDN_PATTERNS:
         if pat in text:
             return pat
     return None
 
 def detect_waf(text):
-    text = text.lower()
+    text = text.lower() if isinstance(text, str) else ''
     for pat in WAF_FINGERPRINTS:
         if pat in text:
             return f"🛡 Обнаружен WAF: {pat.capitalize()}"
     return "🟢 WAF не обнаружен"
 
 def fingerprint_server(text):
-    text = text.lower()
+    text = text.lower() if isinstance(text, str) else ''
     for key, name in FINGERPRINTS.items():
         if key in text:
             return f"🧾 Сервер: {name}"
@@ -189,7 +189,7 @@ def run_check(domain_port: str):
     report.append(f"📆 Срок действия: {whois_exp}" if whois_exp else "❌ WHOIS: ошибка")
 
     report.append("\n🛰 Оценка пригодности")
-    summary = " ".join(report).lower()
+    summary = " ".join(str(s) for s in report if isinstance(s, str)).lower()
     if detect_cdn(summary):
         report.append("❌ Не пригоден: CDN обнаружен")
     elif not http["http2"]:
