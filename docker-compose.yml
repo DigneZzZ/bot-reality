@@ -1,7 +1,7 @@
 services:
   bot:
     container_name: domain-bot
-    build: .
+    image: ghcr.io/dignezzz/bot-reality:latest
     environment:
       BOT_TOKEN: "${BOT_TOKEN}"
       REDIS_HOST: redis
@@ -17,7 +17,7 @@ services:
 
   worker:
     container_name: domain-worker
-    build: .
+    image: ghcr.io/dignezzz/bot-reality:latest
     command: python worker.py
     environment:
       BOT_TOKEN: "${BOT_TOKEN}"
