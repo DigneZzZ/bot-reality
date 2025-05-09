@@ -7,16 +7,26 @@ from time import time
 import redis.asyncio as redis
 import re
 from urllib.parse import urlparse
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, filename="bot.log", format="%(asctime)s - %(levelname)s - %(message)s")
 
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
-r = redis.Redis(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", "6379")),
-    decode_responses=True
-)
+async def get_redis():
+    try:
+        return redis.Redis(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            decode_responses=True,
+            retry_on_timeout=True
+        )
+    except Exception as e:
+        logging.error(f"Failed to connect to Redis: {str(e)}")
+        raise
 
 user_requests = defaultdict(list)
 user_violations = {}
@@ -29,7 +39,8 @@ def extract_domain(text: str):
                 return parsed.hostname
         except:
             return None
-    if re.match(r"^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$", text):
+    # Улучшенное регулярное выражение для доменов и доменов с портом
+    if re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]{0,253}[a-zA-Z0-9](:[0-9]{1,5})?$", text):
         return text
     return None
 
@@ -80,11 +91,18 @@ async def cmd_ping(message: types.Message):
 
 @dp.message_handler(commands=["stats"])
 async def cmd_stats(message: types.Message):
-    qlen = await r.llen("domain_check_queue")
-    keys = await r.keys("result:*")
-    await message.reply(
-        f"📊 В очереди: {qlen} доменов\n🧠 В кэше: {len(keys)} доменов"
-    )
+    r = await get_redis()
+    try:
+        qlen = await r.llen("domain_check_queue")
+        keys = await r.keys("result:*")
+        await message.reply(
+            f"📊 В очереди: {qlen} доменов\n🧠 В кэше: {len(keys)} доменов"
+        )
+    except Exception as e:
+        logging.error(f"Stats command failed: {str(e)}")
+        await message.reply("❌ Ошибка получения статистики")
+    finally:
+        await r.close()
 
 @dp.message_handler(commands=["check"])
 async def cmd_check(message: types.Message):
@@ -102,6 +120,7 @@ async def handle_domain_logic(message: types.Message, input_text: str):
     user_id = message.from_user.id
     penalty, active = get_penalty(user_id)
     if active:
+        await message.reply(f"🚫 Вы ограничены на {penalty//60} минут.")
         return
 
     if rate_limited(user_id):
@@ -116,16 +135,23 @@ async def handle_domain_logic(message: types.Message, input_text: str):
     domain = extract_domain(input_text)
     if not domain:
         timeout = register_violation(user_id)
-        await message.reply("❌ Не удалось извлечь домен. Пользователь будет временно ограничен.")
+        await message.reply(f"❌ Не удалось извлечь домен. Пользователь ограничен на {timeout//60} минут.")
         return
 
-    cached = await r.get(f"result:{domain}")
-    if cached:
-        await message.answer(f"⚡ Результат из кэша:\n\n{cached}")
-        return
+    r = await get_redis()
+    try:
+        cached = await r.get(f"result:{domain}")
+        if cached:
+            await message.answer(f"⚡ Результат из кэша:\n\n{cached}")
+            return
 
-    await enqueue(domain, user_id)
-    await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
+        await enqueue(domain, user_id)
+        await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
+    except Exception as e:
+        logging.error(f"Failed to process domain {domain}: {str(e)}")
+        await message.reply(f"❌ Ошибка обработки {domain}")
+    finally:
+        await r.close()
 
 if __name__ == "__main__":
     from aiogram import executor
