@@ -1,6 +1,6 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
 from redis_queue import enqueue
 from collections import defaultdict
@@ -9,6 +9,7 @@ import redis.asyncio as redis
 import re
 from urllib.parse import urlparse
 import logging
+from datetime import datetime
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, filename="bot.log", format="%(asctime)s - %(levelname)s - %(message)s")
@@ -17,12 +18,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
-# Создание клавиатуры с кнопками
+# Создание инлайн-клавиатуры
 def get_main_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    keyboard.add(KeyboardButton("/check"))
-    keyboard.add(KeyboardButton("/ping"))
-    keyboard.add(KeyboardButton("/stats"))
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("Проверить домен", callback_data="check"))
+    keyboard.add(InlineKeyboardButton("Пинг", callback_data="ping"))
+    keyboard.add(InlineKeyboardButton("История", callback_data="history"))
     return keyboard
 
 async def get_redis():
@@ -33,8 +34,8 @@ async def get_redis():
             decode_responses=True,
             retry_on_timeout=True
         )
-    except Exception as ■■■:
-        logging.error(f"Failed to connect to Redis: {str(■■■)}")
+    except Exception as e:
+        logging.error(f"Failed to connect to Redis: {str(e)}")
         raise
 
 user_requests = defaultdict(list)
@@ -48,7 +49,6 @@ def extract_domain(text: str):
                 return parsed.hostname
         except:
             return None
-    # Улучшенное регулярное выражение для доменов и доменов с портом
     if re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]{0,253}[a-zA-Z0-9](:[0-9]{1,5})?$", text):
         return text
     return None
@@ -81,97 +81,138 @@ def register_violation(user_id):
     user_violations[user_id] = record
     return int(record["until"] - time()) if record["count"] >= 5 else 0
 
+async def check_daily_limit(user_id):
+    r = await get_redis()
+    try:
+        key = f"daily:{user_id}:{datetime.now().strftime('%Y%m%d')}"
+        count = await r.get(key)
+        count = int(count) if count else 0
+        if count >= 100:
+            return False
+        await r.incr(key)
+        await r.expire(key, 86400)  # 24 часа
+        return True
+    finally:
+        await r.aclose()
+
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
-        "/check <домен> — Проверить домен (например, <code>/check example.com</code>)\n"
+        "/check <домен> — Проверить домен (краткий отчёт, например, <code>/check example.com</code>)\n"
+        "/full <домен> — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
         "/ping — Убедиться, что бот работает\n"
-        "/stats — Показать статистику очереди и кэша\n\n"
-        "📩 Просто отправь домен, например: <code>example.com</code>\n"
-        "🚀 Выбери команду ниже для начала!"
+        "/history — Показать последние проверки\n\n"
+        "📩 Можно отправить несколько доменов (через запятую или перенос строки), например:\n"
+        "<code>example.com, google.com</code>\n"
+        "🚀 Выбери действие ниже!"
     )
     await message.answer(welcome_message, parse_mode="HTML", reply_markup=get_main_keyboard())
-
-@dp.message_handler(commands=["help"])
-async def cmd_help(message: types.Message):
-    await message.answer(
-        """👋 Привет! Я бот для проверки доменов на пригодность для прокси и Reality.
-
-Отправь домен (например, `example.com`) или используй команду:
-/check <домен>
-
-/ping — проверить, что бот работает
-/stats — статистика очереди и кэша""",
-        parse_mode="Markdown"
-    )
 
 @dp.message_handler(commands=["ping"])
 async def cmd_ping(message: types.Message):
     await message.reply("🏓 Я жив!")
 
-@dp.message_handler(commands=["stats"])
-async def cmd_stats(message: types.Message):
+@dp.message_handler(commands=["history"])
+async def cmd_history(message: types.Message):
+    user_id = message.from_user.id
     r = await get_redis()
     try:
-        qlen = await r.llen("domain_check_queue")
-        keys = await r.keys("result:*")
-        await message.reply(
-            f"📊 В очереди: {qlen} доменов\n🧠 В кэше: {len(keys)} доменов"
-        )
-    except Exception as e:
-        logging.error(f"Stats command failed: {str(e)}")
-        await message.reply("❌ Ошибка получения статистики")
+        history = await r.lrange(f"history:{user_id}", 0, -1)
+        if not history:
+            await message.reply("📜 История проверок пуста.")
+            return
+        response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
+        await message.reply(response, parse_mode="HTML")
     finally:
         await r.aclose()
 
-@dp.message_handler(commands=["check"])
+@dp.message_handler(commands=["check", "full"])
 async def cmd_check(message: types.Message):
+    command = message.get_command()
+    short_mode = command == "/check"
     args = message.get_args().strip()
     if not args:
-        await message.reply("⛔ Укажи домен, например: /check example.com")
+        await message.reply(f"⛔ Укажи домен, например: {command} example.com")
         return
-    await handle_domain_logic(message, args)
+    await handle_domain_logic(message, args, short_mode=short_mode)
 
 @dp.message_handler()
 async def handle_domain(message: types.Message):
-    await handle_domain_logic(message, message.text.strip())
+    await handle_domain_logic(message, message.text.strip(), short_mode=True)
 
-async def handle_domain_logic(message: types.Message, input_text: str):
+@dp.callback_query_handler()
+async def process_callback(callback_query: types.CallbackQuery):
+    if callback_query.data == "check":
+        await callback_query.message.answer("⛔ Укажи домен, например: /check example.com")
+    elif callback_query.data == "ping":
+        await callback_query.message.answer("🏓 Я жив!")
+    elif callback_query.data == "history":
+        user_id = callback_query.from_user.id
+        r = await get_redis()
+        try:
+            history = await r.lrange(f"history:{user_id}", 0, -1)
+            if not history:
+                await callback_query.message.reply("📜 История проверок пуста.")
+            else:
+                response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
+                await callback_query.message.reply(response, parse_mode="HTML")
+        finally:
+            await r.aclose()
+    await callback_query.answer()
+
+async def handle_domain_logic(message: types.Message, input_text: str, short_mode: bool = True):
     user_id = message.from_user.id
     penalty, active = get_penalty(user_id)
     if active:
         await message.reply(f"🚫 Вы ограничены на {penalty//60} минут.")
         return
 
+    if not await check_daily_limit(user_id):
+        await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+        return
+
     if rate_limited(user_id):
         await message.reply("🚫 Слишком много запросов. Не более 10 проверок за 30 секунд.")
         return
 
-    if len(input_text) > 100 or input_text.count(".") > 5:
+    domains = [d.strip() for d in input_text.replace(',', '\n').split('\n') if d.strip()]
+    if not domains:
         timeout = register_violation(user_id)
-        await message.reply(f"⚠️ Сообщение не похоже на домен. Пользователь ограничен на {timeout//60} минут.")
-        return
-
-    domain = extract_domain(input_text)
-    if not domain:
-        timeout = register_violation(user_id)
-        await message.reply(f"❌ Не удалось извлечь домен. Пользователь ограничен на {timeout//60} минут.")
+        await message.reply(f"❌ Не удалось извлечь домены. Пользователь ограничен на {timeout//60} минут.")
         return
 
     r = await get_redis()
     try:
-        cached = await r.get(f"result:{domain}")
-        if cached:
-            await message.answer(f"⚡ Результат из кэша:\n\n{cached}")
+        valid_domains = []
+        for domain in domains:
+            extracted = extract_domain(domain)
+            if extracted:
+                valid_domains.append(extracted)
+            else:
+                await message.reply(f"⚠️ {domain} не является доменом, пропущен.")
+        if not valid_domains:
+            timeout = register_violation(user_id)
+            await message.reply(f"❌ Ни один домен не распознан. Пользователь ограничен на {timeout//60} минут.")
             return
 
-        await enqueue(domain, user_id)
-        await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
+        for domain in valid_domains:
+            cached = await r.get(f"result:{domain}")
+            if cached:
+                if short_mode:
+                    lines = cached.split("\n")
+                    cached = "\n".join(
+                        line for line in lines
+                        if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности"])
+                    )
+                await message.answer(f"⚡ Результат из кэша для {domain}:\n\n{cached}")
+            else:
+                await enqueue(domain, user_id, short_mode=short_mode)
+                await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
     except Exception as e:
-        logging.error(f"Failed to process domain {domain}: {str(e)}")
-        await message.reply(f"❌ Ошибка обработки {domain}")
+        logging.error(f"Failed to process domains: {str(e)}")
+        await message.reply(f"❌ Ошибка: {str(e)}")
     finally:
         await r.aclose()
 
