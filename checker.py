@@ -1,13 +1,15 @@
-
 import socket
 import ssl
 import time
 import httpx
 import requests
-import subprocess
+import ping3
 import whois
 from datetime import datetime
-import idna
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, filename="checker.log", format="%(asctime)s - %(levelname)s - %(message)s")
 
 CDN_PATTERNS = [
     "cloudflare", "akamai", "fastly", "incapsula", "imperva", "sucuri", "stackpath",
@@ -30,51 +32,54 @@ FINGERPRINTS = {
 def resolve_dns(domain):
     try:
         return socket.gethostbyname(domain)
-    except Exception:
+    except Exception as e:
+        logging.error(f"DNS resolution failed for {domain}: {str(e)}")
         return None
 
-def get_ping(ip):
+def get_ping(ip, timeout=1):
     try:
-        output = subprocess.check_output(["ping", "-c", "4", "-W", "1", ip], stderr=subprocess.DEVNULL).decode()
-        for line in output.splitlines():
-            if "rtt min/avg/max" in line or "round-trip min/avg/max" in line:
-                avg = line.split("/")[4]
-                return float(avg)
-    except Exception:
+        result = ping3.ping(ip, timeout=timeout, unit="ms")
+        if result is not None:
+            return float(result)
+        return None
+    except Exception as e:
+        logging.error(f"Ping failed for {ip}: {str(e)}")
         return None
 
-def get_tls_info(domain, port):
-    info = {"tls": None, "cipher": None, "expires_days": None}
+def get_tls_info(domain, port, timeout=5):
+    info = {"tls": None, "cipher": None, "expires_days": None, "error": None}
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
-            s.settimeout(5)
+            s.settimeout(timeout)
             s.connect((domain, port))
             info["tls"] = s.version()
             info["cipher"] = s.cipher()[0]
             cert = s.getpeercert()
             expire = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
             info["expires_days"] = (expire - datetime.utcnow()).days
-    except Exception:
-        pass
+    except Exception as e:
+        info["error"] = str(e)
+        logging.error(f"TLS check failed for {domain}:{port}: {str(e)}")
     return info
 
-def get_http_info(domain):
-    info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None}
+def get_http_info(domain, timeout=5.0):
+    info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None, "error": None}
     try:
         url = f"https://{domain}"
-        with httpx.Client(http2=True, timeout=5.0) as client:
+        with httpx.Client(http2=True, timeout=timeout) as client:
             start = time.time()
             resp = client.get(url, follow_redirects=True)
             duration = time.time() - start
             info["http2"] = resp.http_version == "HTTP/2"
-            info["http3"] = "h3" in resp.headers.get("alt-svc", "")
+            info["http3"] = any("h3" in svc.lower() for svc in resp.headers.get("alt-svc", "").split(","))
             info["server"] = resp.headers.get("server", "N/A")
             info["ttfb"] = duration
             if resp.history:
-                info["redirect"] = resp.url
-    except Exception:
-        pass
+                info["redirect"] = str(resp.url)
+    except Exception as e:
+        info["error"] = str(e)
+        logging.error(f"HTTP check failed for {domain}: {str(e)}")
     return info
 
 def get_domain_whois(domain):
@@ -83,37 +88,43 @@ def get_domain_whois(domain):
         exp = w.expiration_date
         if isinstance(exp, list):
             exp = exp[0]
-        return exp.isoformat()
-    except Exception:
+        if isinstance(exp, datetime):
+            return exp.isoformat()
+        return None
+    except Exception as e:
+        logging.error(f"WHOIS check failed for {domain}: {str(e)}")
         return None
 
-def get_ip_info(ip):
+def get_ip_info(ip, timeout=5):
     try:
-        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=5).json()
+        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=timeout).json()
         loc = f"{r.get('countryCode')} / {r.get('regionName')} / {r.get('city')}"
         asn = r.get("as", "N/A")
         return loc, asn
-    except Exception:
+    except Exception as e:
+        logging.error(f"IP info check failed for {ip}: {str(e)}")
         return "N/A", "N/A"
 
-def scan_ports(ip):
-    ports = [80, 443, 8443]
+def scan_ports(ip, ports=[80, 443, 8443], timeout=1):
     results = []
     for port in ports:
         try:
-            with socket.create_connection((ip, port), timeout=1):
+            with socket.create_connection((ip, port), timeout=timeout):
                 results.append(f"🟢 TCP {port} открыт")
-        except:
+        except Exception:
             results.append(f"🔴 TCP {port} закрыт")
     return results
 
 def check_spamhaus(ip):
     try:
         rev = ".".join(reversed(ip.split("."))) + ".zen.spamhaus.org"
-        socket.gethostbyname(rev)
-        return "⚠️ В списке Spamhaus"
+        result = socket.gethostbyname(rev)
+        return f"⚠️ В списке Spamhaus (код: {result})"
     except socket.gaierror:
         return "✅ Не найден в Spamhaus"
+    except Exception as e:
+        logging.error(f"Spamhaus check failed for {ip}: {str(e)}")
+        return "❌ Spamhaus: ошибка"
 
 def detect_cdn(text):
     text = text.lower() if isinstance(text, str) else ''
@@ -136,7 +147,7 @@ def fingerprint_server(text):
             return f"🧾 Сервер: {name}"
     return "🧾 Сервер: неизвестен"
 
-def run_check(domain_port: str):
+def run_check(domain_port: str, ping_threshold=50, http_timeout=10.0, port_timeout=2):
     if ":" in domain_port:
         domain, port = domain_port.split(":")
         port = int(port)
@@ -144,7 +155,6 @@ def run_check(domain_port: str):
         domain = domain_port
         port = 443
 
-    domain = idna.encode(domain).decode("utf-8")
     report = [f"🔍 Проверка: {domain}:{port}\n"]
 
     ip = resolve_dns(domain)
@@ -154,7 +164,7 @@ def run_check(domain_port: str):
         return "\n".join(report)
 
     report.append("\n📡 Скан портов")
-    report += scan_ports(ip)
+    report += scan_ports(ip, timeout=port_timeout)
 
     report.append("\n🌍 География и ASN")
     loc, asn = get_ip_info(ip)
@@ -173,13 +183,13 @@ def run_check(domain_port: str):
         if tls["expires_days"] is not None:
             report.append(f"⏳ TLS сертификат истекает через {tls['expires_days']} дн.")
     else:
-        report.append("❌ TLS: ошибка соединения")
+        report.append(f"❌ TLS: ошибка соединения ({tls['error'] or 'неизвестно'})")
 
     report.append("\n🌐 HTTP")
-    http = get_http_info(domain)
+    http = get_http_info(domain, timeout=http_timeout)
     report.append("✅ HTTP/2 поддерживается" if http["http2"] else "❌ HTTP/2 не поддерживается")
     report.append("✅ HTTP/3 (h3) поддерживается" if http["http3"] else "❌ HTTP/3 не поддерживается")
-    report.append(f"⏱️ TTFB: {http['ttfb']:.2f} сек" if http["ttfb"] else "⏱️ TTFB: неизвестно")
+    report.append(f"⏱️ TTFB: {http['ttfb']:.2f} сек" if http["ttfb"] else f"⏱️ TTFB: неизвестно ({http['error'] or 'неизвестно'})")
     report.append(f"🔁 Redirect: {http['redirect']}" if http["redirect"] else "🔁 Без редиректа")
     report.append(fingerprint_server(http.get("server", "")))
     report.append(detect_waf(http.get("server", "")))
@@ -196,25 +206,9 @@ def run_check(domain_port: str):
         report.append("❌ Не пригоден: HTTP/2 отсутствует")
     elif tls["tls"] not in ["TLSv1.3", "TLS 1.3"]:
         report.append("❌ Не пригоден: TLS 1.3 отсутствует")
-    elif ping_ms and ping_ms >= 8:
-        report.append("❌ Не пригоден: высокий пинг")
+    elif ping_ms and ping_ms >= ping_threshold:
+        report.append(f"❌ Не пригоден: высокий пинг ({ping_ms:.1f} ms)")
     else:
         report.append("✅ Пригоден для Reality")
 
     return "\n".join(report)
-# HTTP CHECK START
-try:
-    async with httpx.AsyncClient(http2=True, timeout=10.0, follow_redirects=False) as client:
-        url = f"https://{domain}:{port}"
-        response = await client.get(url)
-
-        result["http2"] = response.http_version == "HTTP/2"
-        result["http3"] = "alt-svc" in response.headers and "h3" in response.headers.get("alt-svc", "").lower()
-        result["server"] = response.headers.get("server", "—")
-        result["http_status"] = response.status_code
-        result["redirect"] = 300 <= response.status_code < 400
-        result["ttfb"] = response.elapsed.total_seconds()
-
-except Exception as e:
-    result["http_error"] = str(e)
-# HTTP CHECK END
