@@ -1,5 +1,6 @@
 import asyncio
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Router, types
+from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
 from redis_queue import enqueue
@@ -16,14 +17,15 @@ logging.basicConfig(level=logging.INFO, filename="bot.log", format="%(asctime)s 
 
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN, parse_mode="HTML")
-dp = Dispatcher(bot)
+router = Router()
 
 # Создание инлайн-клавиатуры
 def get_main_keyboard():
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("Проверить домен", callback_data="check"))
-    keyboard.add(InlineKeyboardButton("Пинг", callback_data="ping"))
-    keyboard.add(InlineKeyboardButton("История", callback_data="history"))
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Проверить домен", callback_data="check")],
+        [InlineKeyboardButton(text="Пинг", callback_data="ping")],
+        [InlineKeyboardButton(text="История", callback_data="history")]
+    ])
     return keyboard
 
 async def get_redis():
@@ -95,7 +97,7 @@ async def check_daily_limit(user_id):
     finally:
         await r.aclose()
 
-@dp.message_handler(commands=["start"])
+@router.message(CommandStart())
 async def cmd_start(message: types.Message):
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
@@ -108,13 +110,13 @@ async def cmd_start(message: types.Message):
         "<code>example.com, google.com</code>\n"
         "🚀 Выбери действие ниже!"
     )
-    await message.answer(welcome_message, parse_mode="HTML", reply_markup=get_main_keyboard())
+    await message.answer(welcome_message, reply_markup=get_main_keyboard())
 
-@dp.message_handler(commands=["ping"])
+@router.message(Command("ping"))
 async def cmd_ping(message: types.Message):
     await message.reply("🏓 Я жив!")
 
-@dp.message_handler(commands=["history"])
+@router.message(Command("history"))
 async def cmd_history(message: types.Message):
     user_id = message.from_user.id
     r = await get_redis()
@@ -124,11 +126,11 @@ async def cmd_history(message: types.Message):
             await message.reply("📜 История проверок пуста.")
             return
         response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
-        await message.reply(response, parse_mode="HTML")
+        await message.reply(response)
     finally:
         await r.aclose()
 
-@dp.message_handler(commands=["check", "full"])
+@router.message(Command("check", "full"))
 async def cmd_check(message: types.Message):
     command = message.get_command()
     short_mode = command == "/check"
@@ -138,11 +140,11 @@ async def cmd_check(message: types.Message):
         return
     await handle_domain_logic(message, args, short_mode=short_mode)
 
-@dp.message_handler()
+@router.message()
 async def handle_domain(message: types.Message):
     await handle_domain_logic(message, message.text.strip(), short_mode=True)
 
-@dp.callback_query_handler()
+@router.callback_query()
 async def process_callback(callback_query: types.CallbackQuery):
     if callback_query.data == "check":
         await callback_query.message.answer("⛔ Укажи домен, например: /check example.com")
@@ -157,7 +159,7 @@ async def process_callback(callback_query: types.CallbackQuery):
                 await callback_query.message.reply("📜 История проверок пуста.")
             else:
                 response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
-                await callback_query.message.reply(response, parse_mode="HTML")
+                await callback_query.message.reply(response)
         finally:
             await r.aclose()
     await callback_query.answer()
@@ -216,6 +218,11 @@ async def handle_domain_logic(message: types.Message, input_text: str, short_mod
     finally:
         await r.aclose()
 
+async def main():
+    from aiogram import Dispatcher
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    from aiogram import executor
-    executor.start_polling(dp)
+    asyncio.run(main())
