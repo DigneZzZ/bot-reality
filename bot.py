@@ -19,12 +19,19 @@ TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 router = Router()
 
-# Создание инлайн-клавиатуры
+# Создание инлайн-клавиатуры для /start
 def get_main_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Проверить домен", callback_data="check")],
         [InlineKeyboardButton(text="Пинг", callback_data="ping")],
         [InlineKeyboardButton(text="История", callback_data="history")]
+    ])
+    return keyboard
+
+# Создание инлайн-кнопки для полного отчёта
+def get_full_report_button(domain: str):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Полный отчёт", callback_data=f"full_report:{domain}")]
     ])
     return keyboard
 
@@ -114,10 +121,12 @@ async def cmd_start(message: types.Message):
         "🚀 Выбери действие ниже!"
     )
     await message.answer(welcome_message, reply_markup=get_main_keyboard())
+    logging.info(f"User {message.from_user.id} executed /start")
 
 @router.message(Command("ping"))
 async def cmd_ping(message: types.Message):
     await message.reply("🏓 Я жив!")
+    logging.info(f"User {message.from_user.id} executed /ping")
 
 @router.message(Command("history"))
 async def cmd_history(message: types.Message):
@@ -130,6 +139,7 @@ async def cmd_history(message: types.Message):
             return
         response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
         await message.reply(response)
+        logging.info(f"User {user_id} viewed history")
     except Exception as e:
         logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при получении истории.")
@@ -145,6 +155,7 @@ async def cmd_check(message: types.Message):
         await message.reply(f"⛔ Укажи домен, например: {command} example.com")
         return
     await handle_domain_logic(message, args, short_mode=short_mode)
+    logging.info(f"User {message.from_user.id} executed {command} with args: {args}")
 
 @router.message()
 async def handle_domain(message: types.Message):
@@ -153,15 +164,16 @@ async def handle_domain(message: types.Message):
         await message.reply("⛔ Укажи валидный домен, например: example.com")
         return
     await handle_domain_logic(message, text, short_mode=True)
+    logging.info(f"User {message.from_user.id} sent domain: {text}")
 
 @router.callback_query()
 async def process_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
     if callback_query.data == "check":
         await callback_query.message.answer("⛔ Укажи домен, например: /check example.com")
     elif callback_query.data == "ping":
         await callback_query.message.answer("🏓 Я жив!")
     elif callback_query.data == "history":
-        user_id = callback_query.from_user.id
         r = await get_redis()
         try:
             history = await r.lrange(f"history:{user_id}", 0, -1)
@@ -170,11 +182,16 @@ async def process_callback(callback_query: types.CallbackQuery):
             else:
                 response = "📜 <b>Последние проверки:</b>\n" + "\n".join(history)
                 await callback_query.message.reply(response)
+            logging.info(f"User {user_id} viewed history via callback")
         except Exception as e:
             logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
             await callback_query.message.reply("❌ Ошибка при получении истории.")
         finally:
             await r.aclose()
+    elif callback_query.data.startswith("full_report:"):
+        domain = callback_query.data.split(":", 1)[1]
+        await handle_domain_logic(callback_query.message, domain, short_mode=False)
+        logging.info(f"User {user_id} requested full report for {domain} via callback")
     await callback_query.answer()
 
 async def handle_domain_logic(message: types.Message, input_text: str, short_mode: bool = True):
@@ -222,7 +239,12 @@ async def handle_domain_logic(message: types.Message, input_text: str, short_mod
                         line for line in lines
                         if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности", "✅", "🟢", "❌"])
                     )
-                await message.answer(f"⚡ Результат из кэша для {domain}:\n\n{cached}")
+                    await message.answer(
+                        f"⚡ Результат из кэша для {domain}:\n\n{cached}",
+                        reply_markup=get_full_report_button(domain)
+                    )
+                else:
+                    await message.answer(f"⚡ Результат из кэша для {domain}:\n\n{cached}")
                 logging.info(f"Returned cached result for {domain} to user {user_id}")
             else:
                 await enqueue(domain, user_id, short_mode=short_mode)
