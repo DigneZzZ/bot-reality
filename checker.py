@@ -63,7 +63,7 @@ def get_tls_info(domain, port, timeout=5):
         logging.error(f"TLS check failed for {domain}:{port}: {str(e)}")
     return info
 
-def get_http_info(domain, timeout=5.0):
+def get_http_info(domain, timeout=10.0):
     info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None, "error": None}
     try:
         url = f"https://{domain}"
@@ -72,11 +72,16 @@ def get_http_info(domain, timeout=5.0):
             resp = client.get(url, follow_redirects=True)
             duration = time.time() - start
             info["http2"] = resp.http_version == "HTTP/2"
-            info["http3"] = any("h3" in svc.lower() for svc in resp.headers.get("alt-svc", "").split(","))
+            # Проверка HTTP/3 через alt-svc
+            alt_svc = resp.headers.get("alt-svc", "")
+            info["http3"] = any("h3" in svc.lower() for svc in alt_svc.split(",") if svc.strip())
             info["server"] = resp.headers.get("server", "N/A")
             info["ttfb"] = duration
             if resp.history:
                 info["redirect"] = str(resp.url)
+    except ImportError as e:
+        info["error"] = "HTTP/2 support requires 'h2' package. Install httpx with `pip install httpx[http2]`."
+        logging.error(f"HTTP check failed for {domain}: {str(e)}")
     except Exception as e:
         info["error"] = str(e)
         logging.error(f"HTTP check failed for {domain}: {str(e)}")
