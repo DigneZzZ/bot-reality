@@ -202,3 +202,19 @@ def run_check(domain_port: str):
         report.append("✅ Пригоден для Reality")
 
     return "\n".join(report)
+# HTTP CHECK START
+try:
+    async with httpx.AsyncClient(http2=True, timeout=10.0, follow_redirects=False) as client:
+        url = f"https://{domain}:{port}"
+        response = await client.get(url)
+
+        result["http2"] = response.http_version == "HTTP/2"
+        result["http3"] = "alt-svc" in response.headers and "h3" in response.headers.get("alt-svc", "").lower()
+        result["server"] = response.headers.get("server", "—")
+        result["http_status"] = response.status_code
+        result["redirect"] = 300 <= response.status_code < 400
+        result["ttfb"] = response.elapsed.total_seconds()
+
+except Exception as e:
+    result["http_error"] = str(e)
+# HTTP CHECK END
