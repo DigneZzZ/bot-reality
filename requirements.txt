@@ -6,3 +6,4 @@ h2==4.1.0
 python-whois==0.7.3 
 idna==3.6 
 ping3==4.0.3
+dnspython==2.4.2
