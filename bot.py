@@ -1,5 +1,6 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import os
 from redis_queue import enqueue
 from collections import defaultdict
@@ -16,6 +17,14 @@ TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
+# Создание клавиатуры с кнопками
+def get_main_keyboard():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    keyboard.add(KeyboardButton("/check"))
+    keyboard.add(KeyboardButton("/ping"))
+    keyboard.add(KeyboardButton("/stats"))
+    return keyboard
+
 async def get_redis():
     try:
         return redis.Redis(
@@ -24,8 +33,8 @@ async def get_redis():
             decode_responses=True,
             retry_on_timeout=True
         )
-    except Exception as e:
-        logging.error(f"Failed to connect to Redis: {str(e)}")
+    except Exception as ■■■:
+        logging.error(f"Failed to connect to Redis: {str(■■■)}")
         raise
 
 user_requests = defaultdict(list)
@@ -72,8 +81,21 @@ def register_violation(user_id):
     user_violations[user_id] = record
     return int(record["until"] - time()) if record["count"] >= 5 else 0
 
-@dp.message_handler(commands=["start", "help"])
+@dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
+    welcome_message = (
+        "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
+        "📋 <b>Доступные команды:</b>\n"
+        "/check <домен> — Проверить домен (например, <code>/check example.com</code>)\n"
+        "/ping — Убедиться, что бот работает\n"
+        "/stats — Показать статистику очереди и кэша\n\n"
+        "📩 Просто отправь домен, например: <code>example.com</code>\n"
+        "🚀 Выбери команду ниже для начала!"
+    )
+    await message.answer(welcome_message, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
     await message.answer(
         """👋 Привет! Я бот для проверки доменов на пригодность для прокси и Reality.
 
@@ -102,7 +124,7 @@ async def cmd_stats(message: types.Message):
         logging.error(f"Stats command failed: {str(e)}")
         await message.reply("❌ Ошибка получения статистики")
     finally:
-        await r.aclose()  # Используем aclose() вместо close()
+        await r.aclose()
 
 @dp.message_handler(commands=["check"])
 async def cmd_check(message: types.Message):
@@ -151,7 +173,7 @@ async def handle_domain_logic(message: types.Message, input_text: str):
         logging.error(f"Failed to process domain {domain}: {str(e)}")
         await message.reply(f"❌ Ошибка обработки {domain}")
     finally:
-        await r.aclose()  # Используем aclose() вместо close()
+        await r.aclose()
 
 if __name__ == "__main__":
     from aiogram import executor
