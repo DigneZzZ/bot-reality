@@ -2,6 +2,7 @@ services:
   bot:
     container_name: domain-bot
     image: ghcr.io/dignezzz/bot-reality:latest
+    command: python bot.py
     environment:
       BOT_TOKEN: "${BOT_TOKEN}"
       REDIS_HOST: redis
@@ -9,11 +10,17 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+        compress: "true"
 
   worker:
     container_name: domain-worker
@@ -26,11 +33,17 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+        compress: "true"
 
   redis:
     container_name: domain-redis
@@ -46,3 +59,4 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+        compress: "true"
