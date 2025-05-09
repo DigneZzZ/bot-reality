@@ -31,7 +31,7 @@ async def enqueue(domain: str, user_id: int):
         logging.error(f"Failed to enqueue {domain}: {str(e)}")
         raise
     finally:
-        await r.close()
+        await r.aclose()  # Используем aclose() вместо close()
 
 async def dequeue():
     r = await get_redis()
@@ -47,4 +47,4 @@ async def dequeue():
         logging.error(f"Failed to dequeue: {str(e)}")
         return None, None
     finally:
-        await r.close()
+        await r.aclose()  # Используем aclose() вместо close()
