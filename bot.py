@@ -102,7 +102,7 @@ async def cmd_stats(message: types.Message):
         logging.error(f"Stats command failed: {str(e)}")
         await message.reply("❌ Ошибка получения статистики")
     finally:
-        await r.close()
+        await r.aclose()  # Используем aclose() вместо close()
 
 @dp.message_handler(commands=["check"])
 async def cmd_check(message: types.Message):
@@ -151,7 +151,7 @@ async def handle_domain_logic(message: types.Message, input_text: str):
         logging.error(f"Failed to process domain {domain}: {str(e)}")
         await message.reply(f"❌ Ошибка обработки {domain}")
     finally:
-        await r.close()
+        await r.aclose()  # Используем aclose() вместо close()
 
 if __name__ == "__main__":
     from aiogram import executor
