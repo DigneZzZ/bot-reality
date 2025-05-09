@@ -1,5 +1,6 @@
 import asyncio
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
 import checker
 from redis_queue import dequeue, get_redis
@@ -11,6 +12,13 @@ logging.basicConfig(level=logging.INFO, filename="worker.log", format="%(asctime
 
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
+
+# Создание инлайн-кнопки для полного отчёта
+def get_full_report_button(domain: str):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Полный отчёт", callback_data=f"full_report:{domain}")]
+    ])
+    return keyboard
 
 async def process_domain(user_id: int, domain: str, short_mode: bool = False):
     try:
@@ -26,7 +34,9 @@ async def process_domain(user_id: int, domain: str, short_mode: bool = False):
                 if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности", "✅", "🟢", "❌"])
             )
             result = short_result if short_result.strip() else result
-        await bot.send_message(user_id, result)
+            await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain))
+        else:
+            await bot.send_message(user_id, result)
         async with await get_redis() as r:
             await r.setex(f"result:{domain}", 86400, result)
             history_key = f"history:{user_id}"
