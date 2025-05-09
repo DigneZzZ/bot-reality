@@ -2,11 +2,19 @@
 import socket
 import ssl
 import time
+import httpx
 import requests
 import subprocess
 import whois
 from datetime import datetime
 import idna
+
+CDN_PATTERNS = [
+    "cloudflare", "akamai", "fastly", "incapsula", "imperva", "sucuri", "stackpath",
+    "cdn77", "edgecast", "keycdn", "azure", "tencent", "alibaba", "aliyun", "bunnycdn",
+    "arvan", "g-core", "mail.ru", "mailru", "vk.com", "vk", "limelight", "lumen",
+    "level3", "centurylink", "cloudfront", "verizon"
+]
 
 def resolve_dns(domain):
     try:
@@ -16,60 +24,48 @@ def resolve_dns(domain):
         return None
 
 def get_ping(ip):
-    ping_methods = [
-        ["ping", "-c", "1", "-W", "1", ip],
-        ["ping6", "-c", "1", "-W", "1", ip],
-        ["ping", "-n", "-c", "1", ip],
-    ]
-    for cmd in ping_methods:
-        try:
-            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=2).decode()
-            if "time=" in output:
-                time_part = output.split("time=")[-1].split(" ")[0]
-                return f"🟢 Ping: ~{time_part}"
-        except Exception:
-            continue
-    return "❌ Ping: ошибка запроса"
+    try:
+        output = subprocess.check_output(["ping", "-c", "4", "-W", "1", ip], stderr=subprocess.DEVNULL).decode()
+        for line in output.splitlines():
+            if "rtt min/avg/max" in line or "round-trip min/avg/max" in line:
+                avg = line.split("/")[4]
+                return float(avg)
+    except Exception:
+        return None
 
 def get_tls_info(domain, port):
+    info = {"tls": None, "cipher": None, "expires_days": None}
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
-            s.settimeout(3)
+            s.settimeout(5)
             s.connect((domain, port))
+            info["tls"] = s.version()
+            info["cipher"] = s.cipher()[0]
             cert = s.getpeercert()
-            tls_version = s.version()
-            cipher = s.cipher()
-            expire_str = cert["notAfter"]
-            expire_date = datetime.strptime(expire_str, "%b %d %H:%M:%S %Y %Z")
-            days_left = (expire_date - datetime.utcnow()).days
-            return [
-                f"✅ {tls_version} поддерживается",
-                f"✅ {cipher[0]} используется",
-                f"⏳ TLS сертификат истекает через {days_left} дн."
-            ]
+            expire = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+            info["expires_days"] = (expire - datetime.utcnow()).days
     except Exception:
-        return ["❌ TLS: не удалось подключиться"]
+        pass
+    return info
 
 def get_http_info(domain):
+    info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None}
     try:
         url = f"https://{domain}"
-        start = time.time()
-        resp = requests.get(url, timeout=5)
-        duration = time.time() - start
-        lines = []
-        if resp.raw.version == 2:
-            lines.append("✅ HTTP/2 поддерживается")
-        if "alt-svc" in resp.headers and "h3" in resp.headers["alt-svc"]:
-            lines.append("✅ HTTP/3 (h3) поддерживается")
-        if "server" in resp.headers:
-            lines.append(f"🔧 Server: {resp.headers['server']}")
-        lines.append(f"⏱️ Время ответа (TTFB): {duration:.2f} сек")
-        if resp.is_redirect or resp.history:
-            lines.append(f"🔁 Redirect: {resp.url}")
-        return lines
+        with httpx.Client(http2=True, timeout=5.0) as client:
+            start = time.time()
+            resp = client.get(url, follow_redirects=True)
+            duration = time.time() - start
+            info["http2"] = resp.http_version == "HTTP/2"
+            info["http3"] = "h3" in resp.headers.get("alt-svc", "")
+            info["server"] = resp.headers.get("server", "N/A")
+            info["ttfb"] = duration
+            if resp.history:
+                info["redirect"] = resp.url
     except Exception:
-        return ["❌ HTTP: ошибка подключения"]
+        pass
+    return info
 
 def get_domain_whois(domain):
     try:
@@ -77,20 +73,28 @@ def get_domain_whois(domain):
         exp = w.expiration_date
         if isinstance(exp, list):
             exp = exp[0]
-        return f"📆 WHOIS срок действия: {exp.isoformat()}"
+        return exp.isoformat()
     except Exception:
-        return "❌ WHOIS: не удалось получить данные"
+        return None
 
 def get_ip_info(ip):
     try:
         r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5).json()
-        loc = r.get("city", "") + ", " + r.get("region", "") + ", " + r.get("country", "")
+        city = r.get("city", "")
+        region = r.get("region", "")
+        country = r.get("country", "")
+        loc = f"{country} / {region} / {city}"
         org = r.get("org", "N/A")
-        asn = org.split()[0] if " " in org else org
-        name = " ".join(org.split()[1:]) if " " in org else "N/A"
-        return [f"📍 IPinfo: {loc}", f"🏢 {org}", f"🛰️ WHOIS: {asn} / {name}"]
+        return loc, org
     except Exception:
-        return ["❌ IPinfo: ошибка запроса"]
+        return "N/A", "N/A"
+
+def detect_cdn(text):
+    text = text.lower()
+    for pat in CDN_PATTERNS:
+        if pat in text:
+            return pat
+    return None
 
 def run_check(domain_port: str):
     if ":" in domain_port:
@@ -101,34 +105,69 @@ def run_check(domain_port: str):
         port = 443
 
     domain = idna.encode(domain).decode("utf-8")
-    result = []
-
-    result.append(f"🔍 Проверка: {domain}:{port}\n")
+    report = []
+    report.append(f"🔍 Проверка: {domain}:{port}\n")
 
     ip = resolve_dns(domain)
-    result.append("🌐 DNS")
-    result.append(f"✅ A: {ip}" if ip else "❌ DNS: не разрешается")
-
-    result.append("\n🌎 IP и ASN")
+    report.append("🌐 DNS")
     if ip:
-        result += get_ip_info(ip)
-        result.append(get_ping(ip))
+        report.append(f"✅ A: {ip}")
     else:
-        result.append("❌ IP: отсутствует")
+        report.append("❌ DNS: не разрешается")
+        return "\n".join(report)
 
-    result.append("\n🔒 TLS")
-    result += get_tls_info(domain, port)
+    report.append("\n🌎 IP и ASN")
+    ip_loc, ip_org = get_ip_info(ip)
+    report.append(f"📍 IPinfo: {ip_loc}")
+    report.append(f"🏢 {ip_org}")
 
-    result.append("\n🌐 HTTP")
-    result += get_http_info(domain)
-
-    result.append("\n📄 WHOIS домена")
-    result.append(get_domain_whois(domain))
-
-    result.append("\n🛰 Оценка пригодности")
-    if ip and "cloudflare" in "".join(result).lower():
-        result.append("❌ Не пригоден: обнаружен CDN")
+    ping_ms = get_ping(ip)
+    if ping_ms is not None:
+        report.append(f"🟢 Ping: ~{ping_ms:.1f} ms")
     else:
-        result.append("✅ Пригоден для Reality")
+        report.append("❌ Ping: ошибка запроса")
 
-    return "\n".join(result)
+    report.append("\n🔒 TLS")
+    tls = get_tls_info(domain, port)
+    if tls["tls"]:
+        report.append(f"✅ {tls['tls']} поддерживается")
+        report.append(f"✅ {tls['cipher']} используется")
+        if tls["expires_days"] is not None:
+            report.append(f"⏳ TLS сертификат истекает через {tls['expires_days']} дн.")
+    else:
+        report.append("❌ TLS: ошибка соединения")
+
+    report.append("\n🌐 HTTP")
+    http = get_http_info(domain)
+    report.append("✅ HTTP/2 поддерживается" if http["http2"] else "❌ HTTP/2 не поддерживается")
+    report.append("✅ HTTP/3 (h3) поддерживается" if http["http3"] else "❌ HTTP/3 не поддерживается")
+    report.append(f"🔧 Server: {http['server']}")
+    if http["ttfb"]:
+        report.append(f"⏱️ Время ответа (TTFB): {http['ttfb']:.2f} сек")
+    if http["redirect"]:
+        report.append(f"🔁 Redirect: {http['redirect']}")
+
+    report.append("\n📄 WHOIS домена")
+    whois_exp = get_domain_whois(domain)
+    if whois_exp:
+        report.append(f"📆 WHOIS срок действия: {whois_exp}")
+    else:
+        report.append("❌ WHOIS: ошибка получения данных")
+
+    report.append("\n🛰 Оценка пригодности")
+    summary_text = " ".join(report).lower()
+    verdict = []
+
+    if detect_cdn(summary_text):
+        verdict.append("❌ Не пригоден: обнаружен CDN")
+    elif not http["http2"]:
+        verdict.append("❌ Не пригоден: HTTP/2 отсутствует")
+    elif tls["tls"] not in ["TLSv1.3", "TLS 1.3"]:
+        verdict.append("❌ Не пригоден: TLS 1.3 отсутствует")
+    elif ping_ms and ping_ms >= 8:
+        verdict.append("❌ Не пригоден: слишком высокий пинг")
+    else:
+        verdict.append("✅ Пригоден для Reality")
+
+    report.append("\n".join(verdict))
+    return "\n".join(report)
