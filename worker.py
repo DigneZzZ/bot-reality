@@ -268,8 +268,16 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
         full_output += f"⏱️ TTFB: {http_result['ttfb'] or 'неизвестно'}\n"
         full_output += f"🔁 {http_result['redirect']}\n"
         full_output += f"🧾 Сервер: {http_result['server']}\n"
-        full_output += f"🟢 WAF {('не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result["waf"]}')}\n"
-        full_output += f"🟢 CDN {('не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result["cdn"]}')}\n"
+        if not waf_result["waf"]:
+            full_output += "🟢 WAF не обнаружен\n"
+        else:
+            full_output += f"🛡 WAF обнаружен: {waf_result['waf']}\n"
+
+        if not cname_result["cdn"]:
+            full_output += "🟢 CDN не обнаружен\n"
+        else:
+            full_output += f"🛰 CDN обнаружен: {cname_result['cdn']}\n"
+
         if cname_result["cname"]:
             full_output += f"DNS CNAME: {cname_result['cname']}\n"
         full_output += "\n📄 WHOIS\n"
