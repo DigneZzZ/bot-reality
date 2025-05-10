@@ -51,8 +51,11 @@ user_requests = defaultdict(list)
 user_violations = {}
 
 def extract_domain(text: str):
-    # Удаляем порт, если указан (например, oogle.com:443 → oogle.com)
-    text = re.sub(r':\d+$', '', text.strip())
+    """Извлекает домен из текста, поддерживает поддомены и URL."""
+    text = text.strip()
+    # Удаляем порт, если указан
+    text = re.sub(r':\d+$', '', text)
+    # Если это URL, извлекаем hostname
     if text.startswith("http://") or text.startswith("https://"):
         try:
             parsed = urlparse(text)
@@ -61,7 +64,8 @@ def extract_domain(text: str):
         except:
             return None
     # Проверяем, является ли строка валидным доменом
-    if re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]{0,253}[a-zA-Z0-9]$", text):
+    # Поддерживает поддомены и домены верхнего уровня
+    if re.match(r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$", text):
         return text
     return None
 
@@ -133,7 +137,7 @@ async def cmd_history(message: types.Message):
     user_id = message.from_user.id
     r = await get_redis()
     try:
-        history = await r.lrange(f"history:{user_id}", 0, 9)  # Только последние 10 записей
+        history = await r.lrange(f"history:{user_id}", 0, 9)
         if not history:
             await message.reply("📜 Ваша история проверок пуста.")
             return
@@ -162,7 +166,7 @@ async def cmd_check(message: types.Message):
 @router.message()
 async def handle_domain(message: types.Message):
     text = message.text.strip()
-    if not text or extract_domain(text) is None:
+    if not text:
         await message.reply("⛔ Укажи валидный домен, например: example.com")
         return
     await handle_domain_logic(message, text, short_mode=True)
@@ -178,7 +182,7 @@ async def process_callback(callback_query: types.CallbackQuery):
     elif callback_query.data == "history":
         r = await get_redis()
         try:
-            history = await r.lrange(f"history:{user_id}", 0, 9)  # Только последние 10 записей
+            history = await r.lrange(f"history:{user_id}", 0, 9)
             if not history:
                 await callback_query.message.reply("📜 Ваша история проверок пуста.")
             else:
@@ -197,7 +201,7 @@ async def process_callback(callback_query: types.CallbackQuery):
         r = await get_redis()
         try:
             cached = await r.get(f"result:{domain}")
-            if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):  # Проверка полноты
+            if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):
                 await callback_query.message.answer(f"⚡ Полный отчёт для {domain}:\n\n{cached}")
             else:
                 await enqueue(domain, user_id, short_mode=False)
@@ -210,7 +214,7 @@ async def process_callback(callback_query: types.CallbackQuery):
             await r.aclose()
     await callback_query.answer()
 
-async def handle_domain_logic(message: types.Message, input_text: str, short_mode: bool = True):
+async def handle_domain_logic(message: types.Message, input_text: str, inconclusive_domain_limit=5, short_mode: bool = True):
     user_id = message.from_user.id
     penalty, active = get_penalty(user_id)
     if active:
@@ -225,25 +229,36 @@ async def handle_domain_logic(message: types.Message, input_text: str, short_mod
         await message.reply("🚫 Слишком много запросов. Не более 10 проверок за 30 секунд.")
         return
 
-    domains = [d.strip() for d in input_text.replace(',', '\n').split('\n') if d.strip()]
+    # Разделяем домены по запятым или переносам строки, удаляем пробелы
+    domains = [d.strip() for d in re.split(r'[,\n]', input_text) if d.strip()]
     if not domains:
-        timeout = register_violation(user_id)
-        await message.reply(f"❌ Не удалось извлечь домены. Пользователь ограничен на {timeout//60} минут.")
+        await message.reply("❌ Не удалось извлечь домены. Укажите валидные домены, например: example.com")
         return
 
     r = await get_redis()
     try:
         valid_domains = []
+        invalid_domains = []
         for domain in domains:
             extracted = extract_domain(domain)
             if extracted:
                 valid_domains.append(extracted)
             else:
-                await message.reply(f"⚠️ {domain} не является валидным доменом, пропущен.")
+                invalid_domains.append(domain)
                 logging.warning(f"Invalid domain input: {domain} by user {user_id}")
+
+        if invalid_domains:
+            await message.reply(
+                f"⚠️ Следующие домены невалидны и будут пропущены:\n" + 
+                "\n".join(f"- {d}" for d in invalid_domains)
+            )
+
         if not valid_domains:
-            timeout = register_violation(user_id)
-            await message.reply(f"❌ Ни один домен не распознан. Пользователь ограничен на {timeout//60} минут.")
+            if len(invalid_domains) >= inconclusive_domain_limit:
+                timeout = register_violation(user_id)
+                await message.reply(f"❌ Все домены невалидны. Пользователь ограничен на {timeout//60} минут.")
+            else:
+                await message.reply("❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
             return
 
         for domain in valid_domains:
