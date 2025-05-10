@@ -71,7 +71,7 @@ def get_tls_info(domain, port, timeout=5):
 
 def get_http_info(domain, timeout=20.0):
     """Проверяет HTTP: HTTP/2, HTTP/3, TTFB, редиректы, сервер."""
-    info = {"http2": False, "http3": False, "server": None, "ttfb": None, "redirect": None, "error": None, "headers": {}}
+    info = {"http2": False, "http3": False, "server": "N/A", "ttfb": None, "redirect": None, "error": None, "headers": {}}
     try:
         url = f"https://{domain}"
         with httpx.Client(http2=True, timeout=timeout) as client:
@@ -153,9 +153,9 @@ def check_spamhaus(ip):
 
 def detect_cdn(http_info, asn):
     """Проверяет наличие CDN на основе заголовков, ASN и других признаков."""
-    headers_str = " ".join(f"{k}:{v}" for k, v in http_info.get("headers", {}).items()).lower()
-    server = http_info.get("server", "").lower()
-    text = f"{server} {headers_str}"
+    headers_str = " ".join(f"{k}:{v}" for k, v in http_info.get("headers", {}).items() if v).lower()
+    server = http_info.get("server", "N/A") or "N/A"
+    text = f"{server} {headers_str}".lower()
     for pat in CDN_PATTERNS:
         if pat in text:
             return pat
@@ -163,19 +163,19 @@ def detect_cdn(http_info, asn):
         return "google"
     return None
 
-def detect_waf(text):
+def detect_waf(server):
     """Проверяет наличие WAF на основе заголовка Server."""
-    text = text.lower() if isinstance(text, str) else ''
+    server = (server or "N/A").lower()
     for pat in WAF_FINGERPRINTS:
-        if pat in text:
+        if pat in server:
             return f"🛡 Обнаружен WAF: {pat.capitalize()}"
     return "🟢 WAF не обнаружен"
 
-def fingerprint_server(text):
+def fingerprint_server(server):
     """Определяет тип сервера на основе заголовка Server."""
-    text = text.lower() if isinstance(text, str) else ''
+    server = (server or "N/A").lower()
     for key, name in FINGERPRINTS.items():
-        if key in text:
+        if key in server:
             return f"🧾 Сервер: {name}"
     return "🧾 Сервер: неизвестен"
 
@@ -227,10 +227,10 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         http_additional.append(f"🔁 Redirect: {http['redirect']}")
     else:
         http_additional.append("🔁 Без редиректа")
-    http_additional.append(fingerprint_server(http.get("server", "")))
+    http_additional.append(fingerprint_server(http.get("server")))
     
     # WAF и CDN
-    waf_result = detect_waf(http.get("server", ""))
+    waf_result = detect_waf(http.get("server"))
     cdn = detect_cdn(http, get_ip_info(ip)[1])
     cdn_result = f"⚠️ CDN обнаружен: {cdn.capitalize()}" if cdn else "🟢 CDN не обнаружен"
 
@@ -251,9 +251,9 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         # Краткий отчёт
         report.append(ping_result)
         report.append("    🔒 TLS")
-        report += tls_results[:1]  # Только версия TLS
+        report += tls_results[:1]
         report.append("    🌐 HTTP")
-        report += http_results  # HTTP/2 и HTTP/3
+        report += http_results
         report.append(waf_result)
         report.append(cdn_result)
         report.append("    🛰 Оценка пригодности")
@@ -286,7 +286,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         whois_exp = get_domain_whois(domain)
         report.append(f"📆 Срок действия: {whois_exp}" if whois_exp else "❌ WHOIS: ошибка")
         
-        report.append("\n�卫星 Оценка пригодности")
+        report.append("\n🛰 Оценка пригодности")
         report += suitability_results
 
     return "\n".join(report)
