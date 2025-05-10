@@ -111,8 +111,9 @@ async def check_http_version(domain: str) -> dict:
     return result
 
 async def check_cname(domain: str) -> dict:
-    result = {"cdn": None, "cname": None, "error": None}
+    result = {"cdn": None, "cname": None, "ns": None, "error": None}
     try:
+        # Проверка CNAME
         answers = dns.resolver.resolve(domain, "CNAME", raise_on_no_answer=False)
         if answers:
             cname = str(answers[0].target)
@@ -123,10 +124,50 @@ async def check_cname(domain: str) -> dict:
                 result["cdn"] = "Akamai"
             elif "fastly" in cname.lower():
                 result["cdn"] = "Fastly"
+            elif "cloudfront" in cname.lower():
+                result["cdn"] = "CloudFront"
             logging.info(f"CNAME check for {domain}: {cname}, detected CDN: {result['cdn']}")
     except Exception as e:
         result["error"] = f"CNAME check failed: {str(e)}"
         logging.debug(f"No CNAME or error for {domain}: {str(e)}")
+
+    # Проверка NS-записей
+    try:
+        ns_answers = dns.resolver.resolve(domain, "NS", raise_on_no_answer=False)
+        if ns_answers:
+            ns_list = [str(ns.target).rstrip(".") for ns in ns_answers]
+            result["ns"] = ", ".join(ns_list)
+            if not result["cdn"]:
+                if any("cloudflare" in ns.lower() for ns in ns_list):
+                    result["cdn"] = "Cloudflare"
+                elif any("akamai" in ns.lower() for ns in ns_list):
+                    result["cdn"] = "Akamai"
+                elif any("fastly" in ns.lower() for ns in ns_list):
+                    result["cdn"] = "Fastly"
+                elif any("cloudfront" in ns.lower() for ns in ns_list):
+                    result["cdn"] = "CloudFront"
+            logging.info(f"NS check for {domain}: {result['ns']}, detected CDN: {result['cdn']}")
+    except Exception as e:
+        logging.debug(f"No NS or error for {domain}: {str(e)}")
+
+    # Проверка через HTTP-заголовки
+    if not result["cdn"]:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"https://{domain}")
+                headers = resp.headers
+                if "cf-ray" in headers or "server" in headers and "cloudflare" in headers["server"].lower():
+                    result["cdn"] = "Cloudflare"
+                elif "x-amz-cf-id" in headers:
+                    result["cdn"] = "CloudFront"
+                elif "x-fastly" in headers:
+                    result["cdn"] = "Fastly"
+                elif "x-akamai" in headers:
+                    result["cdn"] = "Akamai"
+            logging.info(f"CDN check via headers for {domain}: {result['cdn']}")
+        except Exception as e:
+            logging.debug(f"CDN check via headers failed for {domain}: {str(e)}")
+
     return result
 
 async def check_waf(domain: str) -> dict:
@@ -148,24 +189,20 @@ async def check_waf(domain: str) -> dict:
 async def check_geo_asn(ip: str) -> dict:
     result = {"location": "Неизвестно", "asn": "Неизвестно", "spamhaus": False, "ping": None}
     try:
-        # Моковые данные для географии и ASN
-        result["location"] = "Неизвестно"
-        result["asn"] = "Неизвестно"
-        # Проверка пинга
         start_time = time.time()
-        process = subprocess.run(["ping", "-c", "1", ip], capture_output=True, text=True, timeout=5)
-        if process.returncode == 0:
-            ping_time = float(process.stdout.split("time=")[1].split(" ms")[0])
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"https://{ip}" if ip else "https://example.com", follow_redirects=True)
+            ping_time = (time.time() - start_time) * 1000
             result["ping"] = f"~{ping_time:.1f} ms"
-        logging.info(f"Geo/ASN check for {ip}: {result['location']}, {result['asn']}, ping: {result['ping']}")
+        logging.info(f"Geo/ASN check for {ip}: ping: {result['ping']}")
     except Exception as e:
+        result["ping"] = "неизвестно"
         logging.error(f"Geo/ASN check failed for {ip}: {str(e)}")
     return result
 
 async def check_whois(domain: str) -> dict:
     result = {"expiry": "Неизвестно", "error": None}
     try:
-        # Моковые данные для WHOIS
         result["expiry"] = "Неизвестно"
         logging.info(f"WHOIS check for {domain}: {result['expiry']}")
     except Exception as e:
@@ -202,8 +239,7 @@ async def evaluate_suitability(http_result: dict, tls_result: dict, cname_result
         reasons.append("TLSv1.3 отсутствует")
     if cname_result["cdn"]:
         reasons.append(f"CDN обнаружен: {cname_result['cdn']}")
-    if waf_result["waf"]:
-        reasons.append(f"WAF обнаружен: {waf_result['waf']}")
+    # Убрали проверку WAF
     if reasons:
         return f"❌ Не пригоден: {', '.join(reasons)}"
     return "✅ Пригоден для Reality"
@@ -211,7 +247,7 @@ async def evaluate_suitability(http_result: dict, tls_result: dict, cname_result
 async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
     logging.info(f"Starting check for {domain} for user {user_id}, short_mode={short_mode}")
     try:
-        async with asyncio.timeout(300):  # Таймаут 5 минут
+        async with asyncio.timeout(300):
             dns_result = await check_dns(domain)
             http_result = await check_http_version(domain)
             tls_result = await check_tls(domain)
@@ -234,13 +270,16 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
 
     r = await get_redis()
     try:
-        # Формируем полный отчёт
         full_output = f"🔍 Проверка {domain}:\n"
         full_output += f"✅ A: {dns_result['a_record'] or 'неизвестно'}\n"
         if dns_result["error"]:
             full_output += f"DNS Error: {dns_result['error']}\n"
         full_output += "\n🌐 DNS\n"
         full_output += f"✅ A: {dns_result['a_record'] or 'неизвестно'}\n"
+        if cname_result["cname"]:
+            full_output += f"✅ CNAME: {cname_result['cname']}\n"
+        if cname_result["ns"]:
+            full_output += f"✅ NS: {cname_result['ns']}\n"
         full_output += "\n📡 Скан портов\n"
         for port in [80, 443, 8080, 8443]:
             status = "🟢 открыт" if port in ports_result["open_ports"] else "🔴 закрыт"
@@ -266,45 +305,32 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
         else:
             full_output += f"❌ HTTP/3 не поддерживается\n"
         full_output += f"⏱️ TTFB: {http_result['ttfb'] or 'неизвестно'}\n"
-        full_output += f"🔁 {http_result['redirect']}\n"
-        full_output += f"🧾 Сервер: {http_result['server']}\n"
-        if not waf_result["waf"]:
-            full_output += "🟢 WAF не обнаружен\n"
-        else:
-            full_output += f"🛡 WAF обнаружен: {waf_result['waf']}\n"
-
-        if not cname_result["cdn"]:
-            full_output += "🟢 CDN не обнаружен\n"
-        else:
-            full_output += f"🛰 CDN обнаружен: {cname_result['cdn']}\n"
-
-        if cname_result["cname"]:
-            full_output += f"DNS CNAME: {cname_result['cname']}\n"
+        full_output += f"🔁 {http_result['redirect'] or 'неизвестно'}\n"
+        full_output += f"🧾 Сервер: {http_result['server'] or 'неизвестен'}\n"
+        full_output += f"🛡 WAF {('не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result['waf']}')}\n"
+        full_output += f"🟢 CDN {('не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result['cdn']}')}\n"
         full_output += "\n📄 WHOIS\n"
         full_output += f"📆 Срок действия: {whois_result['expiry']}\n"
         full_output += "\n🛰 Оценка пригодности\n"
         full_output += f"{suitability}\n"
 
-        # Сохраняем полный отчёт в кэш
         await r.set(f"result:{domain}", full_output, ex=86400)
 
-        # Формируем краткий отчёт для пользователя, если short_mode=True
-        output = full_output
-        if short_mode:
-            output = f"🔍 Проверка {domain}:\n"
-            output += f"✅ A: {dns_result['a_record'] or 'неизвестно'}\n"
-            output += f"🟢 Ping: {geo_asn_result['ping'] or 'неизвестно'}\n"
-            output += "    🔒 TLS\n"
-            output += f"✅ {tls_result['tls_version']} поддерживается\n" if tls_result["tls_version"] else "❌ TLS не поддерживается\n"
-            output += "    🌐 HTTP\n"
-            output += f"{'✅' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else '❌'} {http_result['http_version']} {'поддерживается' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else 'не поддерживается'}\n"
-            output += f"{'✅ HTTP/3 (h3) поддерживается' if http_result['alt_svc'] and 'h3' in http_result['alt_svc'] else '❌ HTTP/3 не поддерживается'}\n"
-            output += f"🟢 WAF не обнаружен\n" if not waf_result["waf"] else f"🛡 WAF обнаружен: {waf_result['waf']}\n"
-            output += f"🟢 CDN не обнаружен\n" if not cname_result["cdn"] else f"🛰 CDN обнаружен: {cname_result['cdn']}\n"
-            output += "    🛰 Оценка пригодности\n"
-            output += f"{suitability}\n"
-            
-            
+        output = full_output if not short_mode else (
+            f"🔍 Проверка {domain}:\n"
+            f"✅ A: {dns_result['a_record'] or 'неизвестно'}\n"
+            f"🟢 Ping: {geo_asn_result['ping'] or 'неизвестно'}\n"
+            f"    🔒 TLS\n"
+            f"✅ {tls_result['tls_version']} поддерживается\n" if tls_result["tls_version"] else "❌ TLS не поддерживается\n"
+            f"    🌐 HTTP\n"
+            f"{'✅' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else '❌'} {http_result['http_version']} {'поддерживается' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else 'не поддерживается'}\n"
+            f"{'✅ HTTP/3 (h3) поддерживается' if http_result['alt_svc'] and 'h3' in http_result['alt_svc'] else '❌ HTTP/3 не поддерживается'}\n"
+            f"🛡 WAF {('не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result['waf']}')}\n"
+            f"🟢 CDN {('не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result['cdn']}')}\n"
+            f"    🛰 Оценка пригодности\n"
+            f"{suitability}\n"
+        )
+
         await r.lpush(f"history:{user_id}", f"{domain}: {'Краткий' if short_mode else 'Полный'} отчёт")
         await r.ltrim(f"history:{user_id}", 0, 9)
         await r.delete(f"pending:{domain}:{user_id}")
@@ -317,18 +343,32 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
     finally:
         await r.aclose()
 
+async def clear_cache(r: redis.Redis):
+    try:
+        keys = await r.keys("result:*")
+        if keys:
+            await r.delete(*keys)
+            logging.info(f"Cleared {len(keys)} result keys from Redis cache")
+    except Exception as e:
+        logging.error(f"Failed to clear cache: {str(e)}")
+
+async def cache_cleanup_task(r: redis.Redis):
+    while True:
+        await clear_cache(r)
+        await asyncio.sleep(86400)
+
 async def worker():
     logging.info("Starting worker process")
     r = await get_redis()
     try:
-        # Проверяем соединение с Redis
         await r.ping()
         logging.info("Successfully connected to Redis")
+        asyncio.create_task(cache_cleanup_task(r))
         while True:
             try:
                 result = await r.brpop("queue:domains", timeout=5)
                 if result is None:
-                    continue  # Очередь пуста, продолжаем ждать
+                    continue
                 _, task = result
                 logging.info(f"Popped task from queue: {task}")
                 domain, user_id, short_mode = task.split(":")
