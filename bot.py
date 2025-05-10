@@ -15,13 +15,13 @@ from datetime import datetime
 # Настройка логирования
 log_dir = "/app"
 log_file = os.path.join(log_dir, "bot.log")
-os.makedirs(log_dir, exist_ok=True)  # Создаём директорию, если не существует
+os.makedirs(log_dir, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler()  # Дублируем логи в stdout для docker logs
+        logging.StreamHandler()
     ]
 )
 
@@ -134,8 +134,8 @@ async def cmd_start(message: types.Message):
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
-        "/check <домен> — Проверить домен (краткий отчёт, например, <code>/check example.com</code>)\n"
-        "/full <домен> — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
+        "/check \"домен\" — Проверить домен (краткий отчёт, например, <code>/check example.com</code>)\n"
+        "/full \"домен\" — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
         "/ping — Убедиться, что бот работает\n"
         "/history — Показать последние 10 проверок\n"
         "/whoami — Показать ваш Telegram ID\n"
@@ -152,8 +152,12 @@ async def cmd_start(message: types.Message):
         "<code>example.com, google.com</code>\n"
         "🚀 Выбери действие ниже!"
     )
-    await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin))
-    logging.info(f"Sent welcome message to user {user_id} (is_admin={is_admin})")
+    try:
+        await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin))
+        logging.info(f"Sent welcome message to user {user_id} (is_admin={is_admin})")
+    except Exception as e:
+        logging.error(f"Failed to send welcome message to user {user_id}: {str(e)}")
+        await message.answer("❌ Ошибка при отправке сообщения. Попробуйте позже.")
 
 @router.message(Command("whoami"))
 async def cmd_whoami(message: types.Message):
@@ -349,7 +353,7 @@ async def process_callback(callback_query: types.CallbackQuery):
                 logging.info(f"User {user_id} exported {len(domains)} approved domains to {file_path} via callback")
         except Exception as e:
             logging.error(f"Failed to export approved domains for user {user_id}: {str(e)}")
-            await callback_query.message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
+            await message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
         finally:
             await r.aclose()
     elif callback_query.data.startswith("full_report:"):
@@ -450,8 +454,10 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     logging.info("Starting bot polling...")
-    await dp.start_polling(bot)
-    logging.info("Bot polling stopped.")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        logging.info("Bot polling stopped.")
 
 if __name__ == "__main__":
     asyncio.run(main())
