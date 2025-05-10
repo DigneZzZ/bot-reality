@@ -24,13 +24,12 @@ async def process_domain(user_id: int, domain: str, short_mode: bool = False):
     try:
         # Запрос полного отчёта, если short_mode=False
         result = checker.run_check(domain, full_report=not short_mode)
-        logging.info(f"Checker output for {domain}: {result}")  # Логирование для диагностики
+        logging.info(f"Checker output for {domain}: {result}")
         if not result or result.strip() == "":
             logging.error(f"Empty result from checker.run_check for {domain}")
             await bot.send_message(user_id, f"❌ Ошибка: пустой отчёт для {domain}")
             return
         if short_mode:
-            # Краткий отчёт уже сформирован в checker.py
             await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain))
             async with await get_redis() as r:
                 await r.setex(f"result:{domain}", 86400, result)
@@ -41,8 +40,12 @@ async def process_domain(user_id: int, domain: str, short_mode: bool = False):
         async with await get_redis() as r:
             history_key = f"history:{user_id}"
             await r.lpush(history_key, f"{domain}: {result.splitlines()[0]}")
-            await r.ltrim(history_key, 0, 9)  # Храним последние 10 записей
-            await r.expire(history_key, 604800)  # 7 дней
+            await r.ltrim(history_key, 0, 9)
+            await r.expire(history_key, 604800)
+            # Сохраняем пригодные домены в множество
+            if "✅ Пригоден для Reality" in result:
+                await r.sadd("approved_domains", domain)
+                logging.info(f"Saved approved domain {domain} to Redis")
         logging.info(f"Processed {domain} for user {user_id} (short_mode={short_mode})")
     except Exception as e:
         logging.error(f"Failed to process {domain} for user {user_id}: {str(e)}")
@@ -58,7 +61,7 @@ async def clear_cache_monthly():
                     logging.info(f"Cleared {len(keys)} cache entries")
         except Exception as e:
             logging.error(f"Failed to clear cache: {str(e)}")
-        await asyncio.sleep(30 * 24 * 3600)  # 30 дней
+        await asyncio.sleep(30 * 24 * 3600)
 
 async def main():
     asyncio.create_task(clear_cache_monthly())
