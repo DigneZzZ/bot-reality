@@ -1,53 +1,55 @@
-import redis.asyncio as redis
 import os
+import redis.asyncio as redis
 import logging
-from typing import Optional, Tuple
+from logging.handlers import RotatingFileHandler
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, filename="redis_queue.log", format="%(asctime)s - %(levelname)s - %(message)s")
+log_file = "/app/redis_queue.log"
+handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[handler, logging.StreamHandler()]
+)
+logging.info("Redis queue logging initialized")
 
 async def get_redis():
     try:
-        return redis.Redis(
+        redis_client = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6379")),
             password=os.getenv("REDIS_PASSWORD"),
             decode_responses=True,
             retry_on_timeout=True
         )
+        logging.debug("Connected to Redis from redis_queue")
+        return redis_client
     except Exception as e:
         logging.error(f"Failed to connect to Redis: {str(e)}")
         raise
 
-async def enqueue(domain: str, user_id: int, short_mode: bool = False):
+async def is_domain_in_queue(domain: str, user_id: int) -> bool:
     r = await get_redis()
     try:
-        queue_key = "queue:domains"
-        length = await r.llen(queue_key)
-        if length >= 1000:
-            logging.error(f"Queue is full (1000 tasks). Cannot enqueue {domain} for user {user_id}")
-            return False
-        await r.rpush(queue_key, f"{user_id}:{domain}:{short_mode}")
-        logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
-        return True
-    except Exception as e:
-        logging.error(f"Failed to enqueue {domain} for user {user_id}: {str(e)}")
-        return False
+        pending_key = f"pending:{domain}:{user_id}"
+        return await r.exists(pending_key)
     finally:
         await r.aclose()
 
-async def dequeue() -> Optional[Tuple[int, str, bool]]:
+async def enqueue(domain: str, user_id: int, short_mode: bool):
     r = await get_redis()
     try:
-        queue_key = "queue:domains"
-        task = await r.lpop(queue_key)
-        if task:
-            user_id, domain, short_mode = task.split(":", 2)
-            logging.info(f"Dequeued {domain} for user {user_id} (short_mode={short_mode})")
-            return int(user_id), domain, short_mode.lower() == "true"
-        return None, None, None
+        pending_key = f"pending:{domain}:{user_id}"
+        if await r.exists(pending_key):
+            logging.info(f"Domain {domain} for user {user_id} already in queue, skipping")
+            return False
+        task = f"{domain}:{user_id}:{short_mode}"
+        await r.lpush("queue:domains", task)
+        await r.set(pending_key, "1", ex=300)  # Флаг на 5 минут
+        logging.info(f"Enqueued task: {task}")
+        return True
     except Exception as e:
-        logging.error(f"Failed to dequeue task: {str(e)}")
-        return None, None, None
+        logging.error(f"Failed to enqueue task for {domain}: {str(e)}")
+        raise
     finally:
         await r.aclose()
