@@ -299,19 +299,12 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
             output += "    🌐 HTTP\n"
             output += f"{'✅' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else '❌'} {http_result['http_version']} {'поддерживается' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else 'не поддерживается'}\n"
             output += f"{'✅ HTTP/3 (h3) поддерживается' if http_result['alt_svc'] and 'h3' in http_result['alt_svc'] else '❌ HTTP/3 не поддерживается'}\n"
-if not waf_result["waf"]:
-    output += "🟢 WAF не обнаружен\n"
-else:
-    output += f"🛡 WAF обнаружен: {waf_result['waf']}\n"
-    if not cname_result["cdn"]:
-    output += "🟢 CDN не обнаружен\n"
-else:
-    output += f"🛰 CDN обнаружен: {cname_result['cdn']}\n"
-    
-            
-                                    output += "    🛰 Оценка пригодности\n"
+            output += f"🟢 WAF не обнаружен\n" if not waf_result["waf"] else f"🛡 WAF обнаружен: {waf_result['waf']}\n"
+            output += f"🟢 CDN не обнаружен\n" if not cname_result["cdn"] else f"🛰 CDN обнаружен: {cname_result['cdn']}\n"
+            output += "    🛰 Оценка пригодности\n"
             output += f"{suitability}\n"
-
+            
+            
         await r.lpush(f"history:{user_id}", f"{domain}: {'Краткий' if short_mode else 'Полный'} отчёт")
         await r.ltrim(f"history:{user_id}", 0, 9)
         await r.delete(f"pending:{domain}:{user_id}")
