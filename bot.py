@@ -16,18 +16,25 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, filename="bot.log", format="%(asctime)s - %(levelname)s - %(message)s")
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш Telegram ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 bot = Bot(token=TOKEN, parse_mode="HTML")
 router = Router()
 
 # Создание инлайн-клавиатуры для /start
-def get_main_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+def get_main_keyboard(is_admin: bool):
+    buttons = [
         [InlineKeyboardButton(text="Проверить домен", callback_data="check")],
+        [InlineKeyboardButton(text="Полный отчёт", callback_data="full")],
         [InlineKeyboardButton(text="Пинг", callback_data="ping")],
         [InlineKeyboardButton(text="История", callback_data="history")]
-    ])
-    return keyboard
+    ]
+    if is_admin:
+        buttons.extend([
+            [InlineKeyboardButton(text="Список пригодных доменов", callback_data="approved")],
+            [InlineKeyboardButton(text="Очистить список доменов", callback_data="clear_approved")],
+            [InlineKeyboardButton(text="Экспортировать домены", callback_data="export_approved")]
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # Создание инлайн-кнопки для полного отчёта
 def get_full_report_button(domain: str):
@@ -41,6 +48,7 @@ async def get_redis():
         return redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6379")),
+            password=os.getenv("REDIS_PASSWORD"),
             decode_responses=True,
             retry_on_timeout=True
         )
@@ -110,19 +118,30 @@ async def check_daily_limit(user_id):
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
         "/check <домен> — Проверить домен (краткий отчёт, например, <code>/check example.com</code>)\n"
         "/full <домен> — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
         "/ping — Убедиться, что бот работает\n"
-        "/history — Показать последние 10 проверок\n\n"
-        "📩 Можно отправить несколько доменов (через запятую или перенос строки), например:\n"
+        "/history — Показать последние 10 проверок\n"
+    )
+    if is_admin:
+        welcome_message += (
+            "\n🔧 <b>Админ-команды:</b>\n"
+            "/approved — Показать список пригодных доменов\n"
+            "/clear_approved — Очистить список пригодных доменов\n"
+            "/export_approved — Экспортировать список доменов в файл\n"
+        )
+    welcome_message += (
+        "\n📩 Можно отправить несколько доменов (через запятую или перенос строки), например:\n"
         "<code>example.com, google.com</code>\n"
         "🚀 Выбери действие ниже!"
     )
-    await message.answer(welcome_message, reply_markup=get_main_keyboard())
-    logging.info(f"User {message.from_user.id} executed /start")
+    await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin))
+    logging.info(f"User {user_id} executed /start (is_admin={is_admin})")
 
 @router.message(Command("ping"))
 async def cmd_ping(message: types.Message):
@@ -173,6 +192,49 @@ async def cmd_approved(message: types.Message):
     finally:
         await r.aclose()
 
+@router.message(Command("clear_approved"))
+async def cmd_clear_approved(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Доступ к этой команде ограничен.")
+        logging.warning(f"User {user_id} attempted to access /clear_approved")
+        return
+    r = await get_redis()
+    try:
+        deleted = await r.delete("approved_domains")
+        await message.reply("✅ Список пригодных доменов очищен." if deleted else "📜 Список пригодных доменов уже пуст.")
+        logging.info(f"User {user_id} cleared approved domains")
+    except Exception as e:
+        logging.error(f"Failed to clear approved domains for user {user_id}: {str(e)}")
+        await message.reply("❌ Ошибка при очистке списка доменов.")
+    finally:
+        await r.aclose()
+
+@router.message(Command("export_approved"))
+async def cmd_export_approved(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Доступ к этой команде ограничен.")
+        logging.warning(f"User {user_id} attempted to access /export_approved")
+        return
+    r = await get_redis()
+    try:
+        domains = await r.smembers("approved_domains")
+        if not domains:
+            await message.reply("📜 Список пригодных доменов пуст. Экспорт не выполнен.")
+            return
+        file_path = "/app/approved_domains.txt"
+        with open(file_path, "w") as f:
+            for domain in sorted(domains):
+                f.write(f"{domain}\n")
+        await message.reply(f"✅ Список доменов экспортирован в {file_path} ({len(domains)} доменов).")
+        logging.info(f"User {user_id} exported {len(domains)} approved domains to {file_path}")
+    except Exception as e:
+        logging.error(f"Failed to export approved domains for user {user_id}: {str(e)}")
+        await message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
+    finally:
+        await r.aclose()
+
 @router.message(Command("check", "full"))
 async def cmd_check(message: types.Message):
     command = message.get_command()
@@ -196,10 +258,14 @@ async def handle_domain(message: types.Message):
 @router.callback_query()
 async def process_callback(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
+    is_admin = user_id == ADMIN_ID
     if callback_query.data == "check":
         await callback_query.message.answer("⛔ Укажи домен, например: /check example.com")
+    elif callback_query.data == "full":
+        await callback_query.message.answer("⛔ Укажи домен, например: /full example.com")
     elif callback_query.data == "ping":
         await callback_query.message.answer("🏓 Я жив!")
+        logging.info(f"User {user_id} triggered ping callback")
     elif callback_query.data == "history":
         r = await get_redis()
         try:
@@ -214,7 +280,53 @@ async def process_callback(callback_query: types.CallbackQuery):
             logging.info(f"User {user_id} viewed history via callback with {len(history)} entries")
         except Exception as e:
             logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
-            await callback_query.message.reply("❌ Ошибка при получения истории.")
+            await callback_query.message.reply("❌ Ошибка при получении истории.")
+        finally:
+            await r.aclose()
+    elif callback_query.data == "approved" and is_admin:
+        r = await get_redis()
+        try:
+            domains = await r.smembers("approved_domains")
+            if not domains:
+                await callback_query.message.reply("📜 Список пригодных доменов пуст.")
+            else:
+                response = "📜 <b>Пригодные домены:</b>\n"
+                for i, domain in enumerate(sorted(domains), 1):
+                    response += f"{i}. {domain}\n"
+                await callback_query.message.reply(response)
+            logging.info(f"User {user_id} viewed approved domains via callback ({len(domains)} entries)")
+        except Exception as e:
+            logging.error(f"Failed to fetch approved domains for user {user_id}: {str(e)}")
+            await callback_query.message.reply("❌ Ошибка при получении списка доменов.")
+        finally:
+            await r.aclose()
+    elif callback_query.data == "clear_approved" and is_admin:
+        r = await get_redis()
+        try:
+            deleted = await r.delete("approved_domains")
+            await callback_query.message.reply("✅ Список пригодных доменов очищен." if deleted else "📜 Список пригодных доменов уже пуст.")
+            logging.info(f"User {user_id} cleared approved domains via callback")
+        except Exception as e:
+            logging.error(f"Failed to clear approved domains for user {user_id}: {str(e)}")
+            await callback_query.message.reply("❌ Ошибка при очистке списка доменов.")
+        finally:
+            await r.aclose()
+    elif callback_query.data == "export_approved" and is_admin:
+        r = await get_redis()
+        try:
+            domains = await r.smembers("approved_domains")
+            if not domains:
+                await callback_query.message.reply("📜 Список пригодных доменов пуст. Экспорт не выполнен.")
+            else:
+                file_path = "/app/approved_domains.txt"
+                with open(file_path, "w") as f:
+                    for domain in sorted(domains):
+                        f.write(f"{domain}\n")
+                await callback_query.message.reply(f"✅ Список доменов экспортирован в {file_path} ({len(domains)} доменов).")
+                logging.info(f"User {user_id} exported {len(domains)} approved domains to {file_path} via callback")
+        except Exception as e:
+            logging.error(f"Failed to export approved domains for user {user_id}: {str(e)}")
+            await callback_query.message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
         finally:
             await r.aclose()
     elif callback_query.data.startswith("full_report:"):
@@ -233,6 +345,9 @@ async def process_callback(callback_query: types.CallbackQuery):
             await callback_query.message.answer(f"❌ Ошибка: {str(e)}")
         finally:
             await r.aclose()
+    else:
+        await callback_query.message.reply("⛔ Доступ к этой команде ограничен.")
+        logging.warning(f"User {user_id} attempted unauthorized callback: {callback_query.data}")
     await callback_query.answer()
 
 async def handle_domain_logic(message: types.Message, input_text: str, inconclusive_domain_limit=5, short_mode: bool = True):
