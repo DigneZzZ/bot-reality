@@ -67,7 +67,7 @@ async def check_http_version(domain: str) -> dict:
 
     if result["alt_svc"] and "h3" in result["alt_svc"]:
         result["http_version"] = "HTTP/3"
-        logging.info(f"Detected HTTP/3 via alt-svc for {domain}")
+        logging.info(f" detected HTTP/3 via alt-svc for {domain}")
 
     return result
 
@@ -184,7 +184,7 @@ async def worker():
                 if result is None:
                     continue  # Очередь пуста, продолжаем ждать
                 _, task = result
-                task = task.decode("utf-8")  # Декодируем байтовую строку
+                # НЕ декодируем, так как Redis возвращает строки (decode_responses=True)
                 logging.info(f"Popped task from queue: {task}")
                 domain, user_id, short_mode = task.split(":")
                 user_id = int(user_id)
