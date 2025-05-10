@@ -120,15 +120,15 @@ def get_ip_info(ip, timeout=5):
         logging.error(f"IP info check failed for {ip}: {str(e)}")
         return "N/A", "N/A"
 
-def scan_ports(ip, ports=[80, 443, 8443], timeout=1):
+def scan_ports(ip, ports=[80, 443, 8080, 8443], timeout=1):
     """Сканирует указанные порты на IP."""
     results = []
     for port in ports:
         try:
             with socket.create_connection((ip, port), timeout=timeout):
-                results.append(f"🟢 TCP {port} открыт")
+                results.append(f"TCP {port} 🟢 открыт")
         except Exception:
-            results.append(f"🔴 TCP {port} закрыт")
+            results.append(f"TCP {port} 🔴 закрыт")
     return results
 
 def check_spamhaus(ip):
@@ -149,7 +149,7 @@ def check_spamhaus(ip):
         return "✅ Не найден в Spamhaus"
     except Exception as e:
         logging.error(f"Spamhaus check failed for {ip}: {str(e)}")
-        return "❌ Spamhaus: ошибка"
+        return f"❌ Spamhaus: ошибка ({str(e)})"
 
 def detect_cdn(http_info, asn):
     """Проверяет наличие CDN на основе заголовков, ASN и других признаков."""
@@ -169,7 +169,7 @@ def detect_waf(server):
     for pat in WAF_FINGERPRINTS:
         if pat in server:
             return f"🛡 Обнаружен WAF: {pat.capitalize()}"
-    return "🟢 WAF не обнаружен"
+    return "🛡 WAF не обнаружен"
 
 def fingerprint_server(server):
     """Определяет тип сервера на основе заголовка Server."""
@@ -188,7 +188,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         domain = domain_port
         port = 443
 
-    report = [f"🔍 Проверка: {domain}:{port}"]
+    report = [f"🔍 Проверка {domain}:"]
 
     # DNS
     ip = resolve_dns(domain)
@@ -232,7 +232,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
     # WAF и CDN
     waf_result = detect_waf(http.get("server"))
     cdn = detect_cdn(http, get_ip_info(ip)[1])
-    cdn_result = f"⚠️ CDN обнаружен: {cdn.capitalize()}" if cdn else "🟢 CDN не обнаружен"
+    cdn_result = f"🟢 CDN {('не обнаружен' if not cdn else f'обнаружен: {cdn.capitalize()}')}"
 
     # Оценка пригодности
     suitability_results = []
