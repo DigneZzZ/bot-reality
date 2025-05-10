@@ -3,7 +3,7 @@ from aiogram import Bot, Router, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
-from redis_queue import enqueue
+from redis_queue import enqueue, get_redis
 from collections import defaultdict
 from time import time
 import redis.asyncio as redis
@@ -16,6 +16,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, filename="bot.log", format="%(asctime)s - %(levelname)s - %(message)s")
 
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш Telegram ID
 bot = Bot(token=TOKEN, parse_mode="HTML")
 router = Router()
 
@@ -53,9 +54,7 @@ user_violations = {}
 def extract_domain(text: str):
     """Извлекает домен из текста, поддерживает поддомены и URL."""
     text = text.strip()
-    # Удаляем порт, если указан
     text = re.sub(r':\d+$', '', text)
-    # Если это URL, извлекаем hostname
     if text.startswith("http://") or text.startswith("https://"):
         try:
             parsed = urlparse(text)
@@ -63,8 +62,6 @@ def extract_domain(text: str):
                 return parsed.hostname
         except:
             return None
-    # Проверяем, является ли строка валидным доменом
-    # Поддерживает поддомены и домены верхнего уровня
     if re.match(r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$", text):
         return text
     return None
@@ -89,7 +86,7 @@ def get_penalty(user_id):
 def register_violation(user_id):
     record = user_violations.get(user_id, {"count": 0, "until": 0})
     record["count"] += 1
-    duration = [60, 300, 900, 3600]  # 1m, 5m, 15m, 1h
+    duration = [60, 300, 900, 3600]
     if record["count"] >= 5:
         stage = record["count"] - 5
         timeout = duration[min(stage, len(duration) - 1)]
@@ -106,7 +103,7 @@ async def check_daily_limit(user_id):
         if count >= 100:
             return False
         await r.incr(key)
-        await r.expire(key, 86400)  # 24 часа
+        await r.expire(key, 86400)
         return True
     finally:
         await r.aclose()
@@ -149,6 +146,30 @@ async def cmd_history(message: types.Message):
     except Exception as e:
         logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при получении истории.")
+    finally:
+        await r.aclose()
+
+@router.message(Command("approved"))
+async def cmd_approved(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Доступ к этой команде ограничен.")
+        logging.warning(f"User {user_id} attempted to access /approved")
+        return
+    r = await get_redis()
+    try:
+        domains = await r.smembers("approved_domains")
+        if not domains:
+            await message.reply("📜 Список пригодных доменов пуст.")
+            return
+        response = "📜 <b>Пригодные домены:</b>\n"
+        for i, domain in enumerate(sorted(domains), 1):
+            response += f"{i}. {domain}\n"
+        await message.reply(response)
+        logging.info(f"User {user_id} viewed approved domains ({len(domains)} entries)")
+    except Exception as e:
+        logging.error(f"Failed to fetch approved domains for user {user_id}: {str(e)}")
+        await message.reply("❌ Ошибка при получении списка доменов.")
     finally:
         await r.aclose()
 
@@ -229,7 +250,6 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
         await message.reply("🚫 Слишком много запросов. Не более 10 проверок за 30 секунд.")
         return
 
-    # Разделяем домены по запятым или переносам строки, удаляем пробелы
     domains = [d.strip() for d in re.split(r'[,\n]', input_text) if d.strip()]
     if not domains:
         await message.reply("❌ Не удалось извлечь домены. Укажите валидные домены, например: example.com")
@@ -249,7 +269,7 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
 
         if invalid_domains:
             await message.reply(
-                f"⚠️ Следующие домены невалидны и будут пропущены:\n" + 
+                f"⚠️ Следующие домены невалидны и будут пропущены:\n" +
                 "\n".join(f"- {d}" for d in invalid_domains)
             )
 
