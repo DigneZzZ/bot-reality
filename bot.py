@@ -189,7 +189,7 @@ async def process_callback(callback_query: types.CallbackQuery):
             logging.info(f"User {user_id} viewed history via callback with {len(history)} entries")
         except Exception as e:
             logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
-            await callback_query.message.reply("❌ Ошибка при получении истории.")
+            await callback_query.message.reply("❌ Ошибка при получения истории.")
         finally:
             await r.aclose()
     elif callback_query.data.startswith("full_report:"):
@@ -197,13 +197,12 @@ async def process_callback(callback_query: types.CallbackQuery):
         r = await get_redis()
         try:
             cached = await r.get(f"result:{domain}")
-            if cached:
-                lines = cached.split("\n")
-                full_result = "\n".join(lines)  # Возвращаем полный отчёт из кэша
-                await callback_query.message.answer(f"⚡ Полный отчёт для {domain}:\n\n{full_result}")
+            if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):  # Проверка полноты
+                await callback_query.message.answer(f"⚡ Полный отчёт для {domain}:\n\n{cached}")
             else:
                 await enqueue(domain, user_id, short_mode=False)
                 await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт.")
+                logging.info(f"Enqueued {domain} for full report due to incomplete cache")
         except Exception as e:
             logging.error(f"Failed to process full report for {domain} by user {user_id}: {str(e)}")
             await callback_query.message.answer(f"❌ Ошибка: {str(e)}")
