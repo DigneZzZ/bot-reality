@@ -179,6 +179,8 @@ async def cmd_start(message: types.Message):
             "/approved — Показать список пригодных доменов\n"
             "/clear_approved — Очистить список пригодных доменов\n"
             "/export_approved — Экспортировать список доменов в файл\n"
+            "/clearcache — Очистить кэш результатов\n"
+            "/adminhelp — Показать список админских команд\n"
         )
     welcome_message += (
         "\n📩 Можно отправить несколько доменов (через запятую или перенос строки), например:\n"
@@ -330,6 +332,48 @@ async def reset_queue_command(message: types.Message):
         await message.reply("❌ Ошибка при сбросе очереди.")
     finally:
         await r.aclose()
+
+@router.message(Command("clearcache"))
+async def clear_cache_command(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        logging.warning(f"Non-admin user {user_id} attempted to access /clearcache")
+        return
+    r = await get_redis()
+    try:
+        keys = await r.keys("result:*")
+        if keys:
+            await r.delete(*keys)
+            await message.reply(f"✅ Кэш очищен. Удалено {len(keys)} записей.")
+            logging.info(f"Admin {user_id} cleared {len(keys)} result keys from Redis cache")
+        else:
+            await message.reply("✅ Кэш уже пуст.")
+            logging.info(f"Admin {user_id} attempted to clear cache, but it was already empty")
+    except Exception as e:
+        logging.error(f"Failed to clear cache for user {user_id}: {str(e)}")
+        await message.reply(f"❌ Ошибка при очистке кэша: {str(e)}")
+    finally:
+        await r.aclose()
+
+@router.message(Command("adminhelp"))
+async def admin_help_command(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        logging.warning(f"Non-admin user {user_id} attempted to access /adminhelp")
+        return
+    admin_commands = (
+        "📋 <b>Доступные админские команды:</b>\n\n"
+        "/approved — Показать список пригодных доменов\n"
+        "/clear_approved — Очистить список пригодных доменов\n"
+        "/export_approved — Экспортировать список доменов в файл\n"
+        "/reset_queue — Сбросить очередь\n"
+        "/clearcache — Очистить кэш результатов\n"
+        "/adminhelp — Показать этот список команд\n"
+    )
+    await message.reply(admin_commands)
+    logging.info(f"Admin {user_id} viewed admin commands list")
 
 @router.message(Command("check", "full"))
 async def cmd_check(message: types.Message):
