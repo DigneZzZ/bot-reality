@@ -1,18 +1,17 @@
-import os
 import redis.asyncio as redis
+import os
 import logging
+from typing import Optional, Tuple
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, filename="redis_queue.log", format="%(asctime)s - %(levelname)s - %(message)s")
 
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-
 async def get_redis():
     try:
         return redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            password=os.getenv("REDIS_PASSWORD"),
             decode_responses=True,
             retry_on_timeout=True
         )
@@ -20,37 +19,35 @@ async def get_redis():
         logging.error(f"Failed to connect to Redis: {str(e)}")
         raise
 
-QUEUE_NAME = "domain_check_queue"
-
 async def enqueue(domain: str, user_id: int, short_mode: bool = False):
     r = await get_redis()
     try:
-        queue_length = await r.llen(QUEUE_NAME)
-        if queue_length >= 1000:
-            raise Exception("Очередь переполнена, попробуйте позже")
-        await r.rpush(QUEUE_NAME, f"{user_id}|{domain}|{short_mode}")
+        queue_key = "queue:domains"
+        length = await r.llen(queue_key)
+        if length >= 1000:
+            logging.error(f"Queue is full (1000 tasks). Cannot enqueue {domain} for user {user_id}")
+            return False
+        await r.rpush(queue_key, f"{user_id}:{domain}:{short_mode}")
         logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
+        return True
     except Exception as e:
-        logging.error(f"Failed to enqueue {domain}: {str(e)}")
-        raise
+        logging.error(f"Failed to enqueue {domain} for user {user_id}: {str(e)}")
+        return False
     finally:
         await r.aclose()
 
-async def dequeue():
+async def dequeue() -> Optional[Tuple[int, str, bool]]:
     r = await get_redis()
     try:
-        item = await r.blpop(QUEUE_NAME, timeout=5)
-        if item:
-            _, value = item
-            parts = value.split("|")
-            user_id = parts[0]
-            domain = parts[1]
-            short_mode = len(parts) > 2 and parts[2] == "True"
+        queue_key = "queue:domains"
+        task = await r.lpop(queue_key)
+        if task:
+            user_id, domain, short_mode = task.split(":", 2)
             logging.info(f"Dequeued {domain} for user {user_id} (short_mode={short_mode})")
-            return int(user_id), domain, short_mode
-        return None, None, False
+            return int(user_id), domain, short_mode.lower() == "true"
+        return None, None, None
     except Exception as e:
-        logging.error(f"Failed to dequeue: {str(e)}")
-        return None, None, False
+        logging.error(f"Failed to dequeue task: {str(e)}")
+        return None, None, None
     finally:
         await r.aclose()
