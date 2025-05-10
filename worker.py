@@ -22,7 +22,9 @@ def get_full_report_button(domain: str):
 
 async def process_domain(user_id: int, domain: str, short_mode: bool = False):
     try:
-        result = checker.run_check(domain)
+        # Запрос полного отчёта, если short_mode=False
+        result = checker.run_check(domain, full_report=not short_mode)
+        logging.info(f"Checker output for {domain}: {result}")  # Логирование для диагностики
         if not result or result.strip() == "":
             logging.error(f"Empty result from checker.run_check for {domain}")
             await bot.send_message(user_id, f"❌ Ошибка: пустой отчёт для {domain}")
