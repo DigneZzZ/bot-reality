@@ -56,7 +56,8 @@ def get_main_keyboard(is_admin: bool):
         buttons.extend([
             [InlineKeyboardButton(text="Список пригодных доменов", callback_data="approved")],
             [InlineKeyboardButton(text="Очистить список доменов", callback_data="clear_approved")],
-            [InlineKeyboardButton(text="Экспортировать домены", callback_data="export_approved")]
+            [InlineKeyboardButton(text="Экспортировать домены", callback_data="export_approved")],
+            [InlineKeyboardButton(text="Сбросить очередь", callback_data="reset_queue")]
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -170,6 +171,7 @@ async def cmd_start(message: types.Message):
         "/ping — Убедиться, что бот работает\n"
         "/history — Показать последние 10 проверок\n"
         "/whoami — Показать ваш Telegram ID\n"
+        "/reset_queue — Сбросить очередь (только для админа)\n"
     )
     if is_admin:
         welcome_message += (
@@ -307,12 +309,36 @@ async def cmd_export_approved(message: types.Message):
     finally:
         await r.aclose()
 
+@router.message(Command("reset_queue"))
+async def reset_queue_command(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        logging.warning(f"Non-admin user {user_id} attempted to reset queue")
+        return
+    r = await get_redis()
+    try:
+        queue_count = await r.llen("queue:domains")
+        pending_keys = await r.keys("pending:*")
+        await r.delete("queue:domains")
+        if pending_keys:
+            await r.delete(*pending_keys)
+        await message.reply(f"✅ Очередь сброшена. Удалено задач: {queue_count}, ключей pending: {len(pending_keys)}.")
+        logging.info(f"Admin {user_id} reset queue: {queue_count} tasks, {len(pending_keys)} pending keys")
+    except Exception as e:
+        logging.error(f"Failed to reset queue by admin {user_id}: {str(e)}")
+        await message.reply("❌ Ошибка при сбросе очереди.")
+    finally:
+        await r.aclose()
+
 @router.message(Command("check", "full"))
 async def cmd_check(message: types.Message):
     user_id = message.from_user.id
-    command = message.get_command()
+    # Извлекаем команду и аргументы из текста
+    command_text = message.text.strip()
+    command = command_text.split()[0]  # /check или /full
     short_mode = command == "/check"
-    args = message.get_args().strip()
+    args = command_text[len(command):].strip()  # Всё после команды
     if not args:
         await message.reply(f"⛔ Укажи домен, например: {command} example.com")
         return
@@ -416,6 +442,21 @@ async def process_callback(callback_query: types.CallbackQuery):
             await callback_query.message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
         finally:
             await r.aclose()
+    elif callback_query.data == "reset_queue" and is_admin:
+        r = await get_redis()
+        try:
+            queue_count = await r.llen("queue:domains")
+            pending_keys = await r.keys("pending:*")
+            await r.delete("queue:domains")
+            if pending_keys:
+                await r.delete(*pending_keys)
+            await callback_query.message.reply(f"✅ Очередь сброшена. Удалено задач: {queue_count}, ключей pending: {len(pending_keys)}.")
+            logging.info(f"Admin {user_id} reset queue via callback: {queue_count} tasks, {len(pending_keys)} pending keys")
+        except Exception as e:
+            logging.error(f"Failed to reset queue by admin {user_id}: {str(e)}")
+            await callback_query.message.reply("❌ Ошибка при сбросе очереди.")
+        finally:
+            await r.aclose()
     elif callback_query.data.startswith("full_report:"):
         domain = callback_query.data.split(":", 1)[1]
         r = await get_redis()
@@ -455,7 +496,7 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
     r = await get_redis()
     try:
         user_mode = await r.get(f"mode:{user_id}")
-        short_mode = user_mode != "full"
+        short_mode = user_mode != "full" if user_mode else short_mode
     finally:
         await r.aclose()
 
