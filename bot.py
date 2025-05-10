@@ -334,11 +334,10 @@ async def reset_queue_command(message: types.Message):
 @router.message(Command("check", "full"))
 async def cmd_check(message: types.Message):
     user_id = message.from_user.id
-    # Извлекаем команду и аргументы из текста
     command_text = message.text.strip()
-    command = command_text.split()[0]  # /check или /full
+    command = command_text.split()[0]
     short_mode = command == "/check"
-    args = command_text[len(command):].strip()  # Всё после команды
+    args = command_text[len(command):].strip()
     if not args:
         await message.reply(f"⛔ Укажи домен, например: {command} example.com")
         return
@@ -464,6 +463,7 @@ async def process_callback(callback_query: types.CallbackQuery):
             cached = await r.get(f"result:{domain}")
             if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):
                 await callback_query.message.answer(f"⚡ Полный отчёт для {domain}:\n\n{cached}")
+                logging.info(f"Returned cached full report for {domain} to user {user_id}")
             else:
                 if not await check_rate_limit(user_id):
                     await callback_query.message.answer("🚫 Слишком много запросов. Не более 10 в минуту.")
@@ -475,7 +475,7 @@ async def process_callback(callback_query: types.CallbackQuery):
                         await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт.")
                     else:
                         await callback_query.message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
-                logging.info(f"Enqueued {domain} for full report due to incomplete cache")
+                    logging.info(f"Enqueued {domain} for full report for user {user_id}")
         except Exception as e:
             logging.error(f"Failed to process full report for {domain} by user {user_id}: {str(e)}")
             await callback_query.message.answer(f"❌ Ошибка: {str(e)}")
@@ -533,24 +533,32 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
 
         for domain in valid_domains:
             cached = await r.get(f"result:{domain}")
-            if cached:
+            is_full_report = cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"])
+            if cached and (short_mode or is_full_report):
                 if short_mode:
                     lines = cached.split("\n")
-                    cached = "\n".join(
+                    filtered = "\n".join(
                         line for line in lines
-                        if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛡️ CDN", "🔌 Открытые порты", "✅", "🟢", "❌"])
+                        if any(k in line for k in ["🔍 Проверка", "🌐 HTTP", "🛡️ CDN", "🔌 Открытые порты", "🟢 Пригодность"])
                     )
                     await message.answer(
-                        f"⚡ Результат из кэша для {domain}:\n\n{cached}",
+                        f"⚡ Результат из кэша для {domain}:\n\n{filtered}",
                         reply_markup=get_full_report_button(domain)
                     )
+                    logging.info(f"Returned cached short report for {domain} to user {user_id}")
                 else:
-                    await message.answer(f"⚡ Результат из кэша для {domain}:\n\n{cached}")
-                logging.info(f"Returned cached result for {domain} to user {user_id}")
+                    await message.answer(f"⚡ Полный отчёт из кэша для {domain}:\n\n{cached}")
+                    logging.info(f"Returned cached full report for {domain} to user {user_id}")
             else:
+                if not await check_rate_limit(user_id):
+                    await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
+                    return
+                if not await check_daily_limit(user_id):
+                    await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+                    return
                 enqueued = await enqueue(domain, user_id, short_mode=short_mode)
                 if enqueued:
-                    await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
+                    await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт.")
                 else:
                     await message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
                 logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
