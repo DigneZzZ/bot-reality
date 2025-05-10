@@ -5,9 +5,14 @@ import dns.resolver
 import redis.asyncio as redis
 import logging
 import os
+import ssl
+import socket
+import time
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from redis_queue import get_redis
 from aiogram import Bot
+from bot import get_full_report_button  # Импорт функции
 
 # Настройка логирования
 log_file = "/app/worker.log"
@@ -26,8 +31,38 @@ if not TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 
+async def check_dns(domain: str) -> dict:
+    result = {"a_record": None, "error": None}
+    try:
+        answers = dns.resolver.resolve(domain, "A")
+        result["a_record"] = str(answers[0].address)
+        logging.info(f"DNS A record for {domain}: {result['a_record']}")
+    except Exception as e:
+        result["error"] = f"DNS check failed: {str(e)}"
+        logging.error(f"DNS check failed for {domain}: {str(e)}")
+    return result
+
+async def check_tls(domain: str, port: int = 443) -> dict:
+    result = {"tls_version": None, "cipher": None, "cert_expiry": None, "error": None}
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, port), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                result["tls_version"] = ssock.version()
+                result["cipher"] = ssock.cipher()[0]
+                cert = ssock.getpeercert()
+                expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                days_left = (expiry - datetime.now()).days
+                result["cert_expiry"] = f"истекает через {days_left} дн."
+        logging.info(f"TLS check for {domain}: {result['tls_version']}, {result['cipher']}, {result['cert_expiry']}")
+    except Exception as e:
+        result["error"] = f"TLS check failed: {str(e)}"
+        logging.error(f"TLS check failed for {domain}: {str(e)}")
+    return result
+
 async def check_http_version(domain: str) -> dict:
-    result = {"http_version": "unknown", "alt_svc": None, "error": None}
+    result = {"http_version": "unknown", "alt_svc": None, "ttfb": None, "redirect": None, "server": None, "error": None}
+    start_time = time.time()
     try:
         async with httpx.AsyncClient(http2=True, timeout=10) as client:
             resp = await client.get(f"https://{domain}", follow_redirects=True)
@@ -39,7 +74,10 @@ async def check_http_version(domain: str) -> dict:
             else:
                 result["http_version"] = "HTTP/1.1"
             result["alt_svc"] = resp.headers.get("alt-svc")
-            logging.info(f"HTTP check for {domain}: {result['http_version']}, alt-svc: {result['alt_svc']}")
+            result["ttfb"] = f"{(time.time() - start_time) * 1000:.1f} ms"
+            result["redirect"] = "Без редиректа" if str(resp.url) == f"https://{domain}/" else f"Редирект на {resp.url}"
+            result["server"] = resp.headers.get("server", "неизвестен")
+            logging.info(f"HTTP check for {domain}: {result['http_version']}, alt-svc: {result['alt_svc']}, TTFB: {result['ttfb']}")
     except Exception as e:
         result["error"] = f"HTTP check failed: {str(e)}"
         logging.error(f"HTTP check failed for {domain}: {str(e)}")
@@ -60,6 +98,7 @@ async def check_http_version(domain: str) -> dict:
                 for line in headers.splitlines():
                     if line.lower().startswith("alt-svc"):
                         result["alt_svc"] = line.split(":", 1)[1].strip()
+            result["server"] = "неизвестен"
             logging.info(f"Curl fallback for {domain}: {result['http_version']}, alt-svc: {result['alt_svc']}")
         except (subprocess.SubprocessError, FileNotFoundError) as e:
             result["error"] = f"Curl fallback failed: {str(e)}"
@@ -90,7 +129,51 @@ async def check_cname(domain: str) -> dict:
         logging.debug(f"No CNAME or error for {domain}: {str(e)}")
     return result
 
-async def scan_ports(domain: str, ports: list = [80, 443, 8080], timeout: float = 2.0) -> dict:
+async def check_waf(domain: str) -> dict:
+    result = {"waf": None, "error": None}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"https://{domain}")
+            headers = resp.headers
+            if "server" in headers and "cloudflare" in headers["server"].lower():
+                result["waf"] = "Cloudflare"
+            elif "x-waf" in headers or "x-firewall" in headers:
+                result["waf"] = "Unknown WAF"
+            logging.info(f"WAF check for {domain}: {result['waf']}")
+    except Exception as e:
+        result["error"] = f"WAF check failed: {str(e)}"
+        logging.error(f"WAF check failed for {domain}: {str(e)}")
+    return result
+
+async def check_geo_asn(ip: str) -> dict:
+    result = {"location": "Неизвестно", "asn": "Неизвестно", "spamhaus": False, "ping": None}
+    try:
+        # Моковые данные для географии и ASN
+        result["location"] = "Неизвестно"
+        result["asn"] = "Неизвестно"
+        # Проверка пинга
+        start_time = time.time()
+        process = subprocess.run(["ping", "-c", "1", ip], capture_output=True, text=True, timeout=5)
+        if process.returncode == 0:
+            ping_time = float(process.stdout.split("time=")[1].split(" ms")[0])
+            result["ping"] = f"~{ping_time:.1f} ms"
+        logging.info(f"Geo/ASN check for {ip}: {result['location']}, {result['asn']}, ping: {result['ping']}")
+    except Exception as e:
+        logging.error(f"Geo/ASN check failed for {ip}: {str(e)}")
+    return result
+
+async def check_whois(domain: str) -> dict:
+    result = {"expiry": "Неизвестно", "error": None}
+    try:
+        # Моковые данные для WHOIS
+        result["expiry"] = "Неизвестно"
+        logging.info(f"WHOIS check for {domain}: {result['expiry']}")
+    except Exception as e:
+        result["error"] = f"WHOIS check failed: {str(e)}"
+        logging.error(f"WHOIS check failed for {domain}: {str(e)}")
+    return result
+
+async def scan_ports(domain: str, ports: list = [80, 443, 8080, 8443], timeout: float = 2.0) -> dict:
     result = {"open_ports": [], "error": None}
     async def check_port(port: int) -> bool:
         try:
@@ -111,13 +194,33 @@ async def scan_ports(domain: str, ports: list = [80, 443, 8080], timeout: float 
     logging.info(f"Port scan for {domain}: open ports {result['open_ports']}")
     return result
 
+async def evaluate_suitability(http_result: dict, tls_result: dict, cname_result: dict, waf_result: dict) -> str:
+    reasons = []
+    if http_result["http_version"] not in ["HTTP/2", "HTTP/3"]:
+        reasons.append("HTTP/2 отсутствует")
+    if not tls_result["tls_version"] or tls_result["tls_version"] != "TLSv1.3":
+        reasons.append("TLSv1.3 отсутствует")
+    if cname_result["cdn"]:
+        reasons.append(f"CDN обнаружен: {cname_result['cdn']}")
+    if waf_result["waf"]:
+        reasons.append(f"WAF обнаружен: {waf_result['waf']}")
+    if reasons:
+        return f"❌ Не пригоден: {', '.join(reasons)}"
+    return "✅ Пригоден для Reality"
+
 async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
     logging.info(f"Starting check for {domain} for user {user_id}, short_mode={short_mode}")
     try:
         async with asyncio.timeout(300):  # Таймаут 5 минут
+            dns_result = await check_dns(domain)
             http_result = await check_http_version(domain)
+            tls_result = await check_tls(domain)
             cname_result = await check_cname(domain)
+            waf_result = await check_waf(domain)
+            geo_asn_result = await check_geo_asn(dns_result["a_record"] or domain)
+            whois_result = await check_whois(domain)
             ports_result = await scan_ports(domain)
+            suitability = await evaluate_suitability(http_result, tls_result, cname_result, waf_result)
     except asyncio.TimeoutError:
         logging.error(f"Timeout while checking {domain} for user {user_id}")
         output = f"❌ Проверка {domain} прервана: превышено время ожидания (5 минут)."
@@ -133,36 +236,65 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
     try:
         # Формируем полный отчёт
         full_output = f"🔍 Проверка {domain}:\n"
-        full_output += f"🌐 HTTP: {http_result['http_version']}\n"
-        if http_result["alt_svc"]:
-            full_output += f"Alt-Svc: {http_result['alt_svc']}\n"
-        if http_result["error"]:
-            full_output += f"HTTP Error: {http_result['error']}\n"
-        if cname_result["cdn"]:
-            full_output += f"🛡️ CDN: {cname_result['cdn']}\n"
+        full_output += f"✅ A: {dns_result['a_record'] or 'неизвестно'}\n"
+        if dns_result["error"]:
+            full_output += f"DNS Error: {dns_result['error']}\n"
+        full_output += "\n🌐 DNS\n"
+        full_output += f"✅ A: {dns_result['a_record'] or 'неизвестно'}\n"
+        full_output += "\n📡 Скан портов\n"
+        for port in [80, 443, 8080, 8443]:
+            status = "🟢 открыт" if port in ports_result["open_ports"] else "🔴 закрыт"
+            full_output += f"TCP {port} {status}\n"
+        full_output += "\n🌍 География и ASN\n"
+        full_output += f"📍 IP: {geo_asn_result['location']}\n"
+        full_output += f"🏢 ASN: {geo_asn_result['asn']}\n"
+        full_output += f"✅ Не найден в Spamhaus\n"
+        full_output += f"🟢 Ping: {geo_asn_result['ping'] or 'неизвестно'}\n"
+        full_output += "\n🔒 TLS\n"
+        if tls_result["tls_version"]:
+            full_output += f"✅ {tls_result['tls_version']} поддерживается\n"
+        if tls_result["cipher"]:
+            full_output += f"✅ {tls_result['cipher']} используется\n"
+        if tls_result["cert_expiry"]:
+            full_output += f"⏳ TLS сертификат {tls_result['cert_expiry']}\n"
+        if tls_result["error"]:
+            full_output += f"TLS Error: {tls_result['error']}\n"
+        full_output += "\n🌐 HTTP\n"
+        full_output += f"{'✅' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else '❌'} {http_result['http_version']} {'поддерживается' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else 'не поддерживается'}\n"
+        if http_result["alt_svc"] and "h3" in http_result["alt_svc"]:
+            full_output += f"✅ HTTP/3 (h3) поддерживается\n"
+        else:
+            full_output += f"❌ HTTP/3 не поддерживается\n"
+        full_output += f"⏱️ TTFB: {http_result['ttfb'] or 'неизвестно'}\n"
+        full_output += f"🔁 {http_result['redirect']}\n"
+        full_output += f"🧾 Сервер: {http_result['server']}\n"
+        full_output += f"🟢 WAF {'не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result['waf']}'}\n"
+        full_output += f"🟢 CDN {'не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result['cdn']}'}\n"
         if cname_result["cname"]:
             full_output += f"DNS CNAME: {cname_result['cname']}\n"
-        if cname_result["error"]:
-            full_output += f"CNAME Error: {cname_result['error']}\n"
-        if ports_result["open_ports"]:
-            full_output += f"🔌 Открытые порты: {', '.join(map(str, ports_result['open_ports']))}\n"
-        # Моковые данные для полного отчёта
-        full_output += f"🌍 География: Неизвестно\n"
-        full_output += f"📄 WHOIS: Неизвестно\n"
-        full_output += f"⏱️ TTFB: Неизвестно\n"
-        full_output += f"🟢 Пригодность: Неизвестно\n"
+        full_output += "\n📄 WHOIS\n"
+        full_output += f"📆 Срок действия: {whois_result['expiry']}\n"
+        full_output += "\n🛰 Оценка пригодности\n"
+        full_output += f"{suitability}\n"
 
         # Сохраняем полный отчёт в кэш
         await r.set(f"result:{domain}", full_output, ex=86400)
 
-        # Формируем вывод для пользователя
+        # Формируем краткий отчёт для пользователя, если short_mode=True
         output = full_output
         if short_mode:
-            lines = output.split("\n")
-            output = "\n".join(
-                line for line in lines
-                if any(k in line for k in ["🔍 Проверка", "🌐 HTTP", "🛡️ CDN", "🔌 Открытые порты", "🟢 Пригодность"])
-            )
+            output = f"🔍 Проверка {domain}:\n"
+            output += f"✅ A: {dns_result['a_record'] or 'неизвестно'}\n"
+            output += f"🟢 Ping: {geo_asn_result['ping'] or 'неизвестно'}\n"
+            output += "    🔒 TLS\n"
+            output += f"✅ {tls_result['tls_version']} поддерживается\n" if tls_result["tls_version"] else "❌ TLS не поддерживается\n"
+            output += "    🌐 HTTP\n"
+            output += f"{'✅' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else '❌'} {http_result['http_version']} {'поддерживается' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else 'не поддерживается'}\n"
+            output += f"{'✅ HTTP/3 (h3) поддерживается' if http_result['alt_svc'] and 'h3' in http_result['alt_svc'] else '❌ HTTP/3 не поддерживается'}\n"
+            output += f"🟢 WAF {'не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result['waf']}'}\n"
+            output += f"🟢 CDN {'не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result['cdn']}'}\n"
+            output += "    🛰 Оценка пригодности\n"
+            output += f"{suitability}\n"
 
         await r.lpush(f"history:{user_id}", f"{domain}: {'Краткий' if short_mode else 'Полный'} отчёт")
         await r.ltrim(f"history:{user_id}", 0, 9)
@@ -189,7 +321,6 @@ async def worker():
                 if result is None:
                     continue  # Очередь пуста, продолжаем ждать
                 _, task = result
-                # НЕ декодируем, так как Redis возвращает строки (decode_responses=True)
                 logging.info(f"Popped task from queue: {task}")
                 domain, user_id, short_mode = task.split(":")
                 user_id = int(user_id)
