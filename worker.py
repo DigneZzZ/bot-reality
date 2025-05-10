@@ -49,6 +49,11 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
         # Сохраняем полный отчет в кэш
         await r.set(f"result:{domain}", report, ex=86400)
 
+        # Проверяем пригодность домена и добавляем в approved_domains
+        if "✅ Пригоден для Reality" in report:
+            await r.sadd("approved_domains", domain)
+            logging.info(f"Added {domain} to approved_domains for user {user_id}")
+
         output = report  # Используем отчет напрямую из run_check
 
         await r.lpush(f"history:{user_id}", f"{domain}: {'Краткий' if short_mode else 'Полный'} отчёт")
