@@ -15,15 +15,31 @@ from datetime import datetime
 # Настройка логирования
 log_dir = "/app"
 log_file = os.path.join(log_dir, "bot.log")
+fallback_log_file = "/tmp/bot.log"
 os.makedirs(log_dir, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
+try:
+    # Проверяем возможность записи в /app
+    with open(log_file, "a") as f:
+        f.write("")
+    log_handlers = [
         logging.FileHandler(log_file),
         logging.StreamHandler()
     ]
+except Exception as e:
+    # Если не удалось создать /app/bot.log, используем /tmp
+    logging.warning(f"Failed to initialize logging to {log_file}: {str(e)}. Falling back to {fallback_log_file}")
+    os.makedirs("/tmp", exist_ok=True)
+    log_handlers = [
+        logging.FileHandler(fallback_log_file),
+        logging.StreamHandler()
+    ]
+
+logging.basicConfig(
+    level=logging.DEBUG,  # Увеличиваем уровень для отладки
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=log_handlers
 )
+logging.info("Logging initialized")
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -55,13 +71,15 @@ def get_full_report_button(domain: str):
 
 async def get_redis():
     try:
-        return redis.Redis(
+        redis_client = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6379")),
             password=os.getenv("REDIS_PASSWORD"),
             decode_responses=True,
             retry_on_timeout=True
         )
+        logging.debug("Connected to Redis")
+        return redis_client
     except Exception as e:
         logging.error(f"Failed to connect to Redis: {str(e)}")
         raise
@@ -130,7 +148,7 @@ async def check_daily_limit(user_id):
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
-    logging.info(f"Processing /start for user {user_id} (is_admin={is_admin})")
+    logging.debug(f"Processing /start for user {user_id} (is_admin={is_admin})")
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
@@ -285,7 +303,7 @@ async def handle_domain(message: types.Message):
 async def process_callback(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
     is_admin = user_id == ADMIN_ID
-    logging.info(f"Processing callback {callback_query.data} for user {user_id} (is_admin={is_admin})")
+    logging.debug(f"Processing callback {callback_query.data} for user {user_id} (is_admin={is_admin})")
     if callback_query.data == "check":
         await callback_query.message.answer("⛔ Укажи домен, например: /check example.com")
     elif callback_query.data == "full":
@@ -353,7 +371,7 @@ async def process_callback(callback_query: types.CallbackQuery):
                 logging.info(f"User {user_id} exported {len(domains)} approved domains to {file_path} via callback")
         except Exception as e:
             logging.error(f"Failed to export approved domains for user {user_id}: {str(e)}")
-            await message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
+            await callback_query.message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
         finally:
             await r.aclose()
     elif callback_query.data.startswith("full_report:"):
@@ -460,4 +478,5 @@ async def main():
         logging.info("Bot polling stopped.")
 
 if __name__ == "__main__":
+    logging.debug("Starting bot script")
     asyncio.run(main())
