@@ -4,6 +4,7 @@ import subprocess
 import dns.resolver
 import redis.asyncio as redis
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from redis_queue import get_redis
 from aiogram import Bot
@@ -20,6 +21,9 @@ logging.info("Worker logging initialized")
 
 # Инициализация Telegram Bot
 TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    logging.error("BOT_TOKEN environment variable is not set")
+    raise ValueError("BOT_TOKEN environment variable is not set")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 
 async def check_http_version(domain: str) -> dict:
