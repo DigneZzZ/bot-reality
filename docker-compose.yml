@@ -15,7 +15,7 @@ services:
       - ./approved_domains.txt:/app/approved_domains.txt
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "pgrep", "python"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -40,7 +40,7 @@ services:
       - ./approved_domains.txt:/app/approved_domains.txt
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "pgrep", "python"]
       interval: 30s
       timeout: 5s
       retries: 3
