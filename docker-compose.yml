@@ -4,11 +4,15 @@ services:
     image: ghcr.io/dignezzz/bot-reality:latest
     command: python bot.py
     environment:
-      BOT_TOKEN: "${BOT_TOKEN}"
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      - BOT_TOKEN=${BOT_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - ADMIN_ID=${ADMIN_ID}
     depends_on:
       - redis
+    volumes:
+      - ./approved_domains.txt:/app/approved_domains.txt
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -21,17 +25,20 @@ services:
         max-size: "10m"
         max-file: "3"
         compress: "true"
-
   worker:
     container_name: domain-worker
     image: ghcr.io/dignezzz/bot-reality:latest
     command: python worker.py
     environment:
-      BOT_TOKEN: "${BOT_TOKEN}"
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      - BOT_TOKEN=${BOT_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${ Kathleen
+      - ADMIN_ID=${ADMIN_ID}
     depends_on:
       - redis
+    volumes:
+      - ./approved_domains.txt:/app/approved_domains.txt
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -46,13 +53,15 @@ services:
         max-size: "10m"
         max-file: "3"
         compress: "true"
-
   redis:
     container_name: domain-redis
     image: redis:7
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -62,3 +71,5 @@ services:
         max-size: "5m"
         max-file: "2"
         compress: "true"
+volumes:
+  redis_data:
