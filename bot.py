@@ -21,23 +21,20 @@ os.makedirs(log_dir, exist_ok=True)
 log_handlers = []
 
 try:
-    # Проверяем возможность записи в /app
     with open(log_file, "a") as f:
         f.write("")
-    # Настраиваем ротацию логов: 10 МБ на файл, максимум 5 файлов
     file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
     log_handlers.append(file_handler)
 except Exception as e:
-    # Если не удалось создать /app/bot.log, используем /tmp
     logging.warning(f"Failed to initialize logging to {log_file}: {str(e)}. Falling back to {fallback_log_file}")
     os.makedirs("/tmp", exist_ok=True)
     file_handler = RotatingFileHandler(fallback_log_file, maxBytes=10*1024*1024, backupCount=5)
     log_handlers.append(file_handler)
 
-log_handlers.append(logging.StreamHandler())  # Логи в stdout для docker logs
+log_handlers.append(logging.StreamHandler())
 
 logging.basicConfig(
-    level=logging.INFO,  # INFO для продакшена
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=log_handlers
 )
@@ -48,7 +45,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 bot = Bot(token=TOKEN, parse_mode="HTML")
 router = Router()
 
-# Создание инлайн-клавиатуры для /start
 def get_main_keyboard(is_admin: bool):
     buttons = [
         [InlineKeyboardButton(text="Проверить домен", callback_data="check")],
@@ -64,7 +60,6 @@ def get_main_keyboard(is_admin: bool):
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Создание инлайн-кнопки для полного отчёта
 def get_full_report_button(domain: str):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Полный отчёт", callback_data=f"full_report:{domain}")]
@@ -90,7 +85,6 @@ user_requests = defaultdict(list)
 user_violations = {}
 
 def extract_domain(text: str):
-    """Извлекает домен из текста, поддерживает поддомены и URL."""
     text = text.strip()
     text = re.sub(r':\d+$', '', text)
     if text.startswith("http://") or text.startswith("https://"):
@@ -138,11 +132,11 @@ async def check_rate_limit(user_id: int) -> bool:
         key = f"rate:{user_id}:{datetime.now().strftime('%Y%m%d%H%M')}"
         count = await r.get(key)
         count = int(count) if count else 0
-        if count >= 10:  # Не более 10 запросов в минуту
+        if count >= 10:
             logging.warning(f"Rate limit exceeded for user {user_id}: {count} requests")
             return False
         await r.incr(key)
-        await r.expire(key, 60)  # TTL 1 минута
+        await r.expire(key, 60)
         return True
     finally:
         await r.aclose()
@@ -153,11 +147,11 @@ async def check_daily_limit(user_id: int) -> bool:
         key = f"daily:{user_id}:{datetime.now().strftime('%Y%m%d')}"
         count = await r.get(key)
         count = int(count) if count else 0
-        if count >= 100:  # Не более 100 запросов в день
+        if count >= 100:
             logging.warning(f"Daily limit exceeded for user {user_id}: {count} requests")
             return False
         await r.incr(key)
-        await r.expire(key, 86400)  # TTL 1 день
+        await r.expire(key, 86400)
         return True
     finally:
         await r.aclose()
@@ -430,8 +424,16 @@ async def process_callback(callback_query: types.CallbackQuery):
             if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):
                 await callback_query.message.answer(f"⚡ Полный отчёт для {domain}:\n\n{cached}")
             else:
-                await enqueue(domain, user_id, short_mode=False)
-                await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт.")
+                if not await check_rate_limit(user_id):
+                    await callback_query.message.answer("🚫 Слишком много запросов. Не более 10 в минуту.")
+                elif not await check_daily_limit(user_id):
+                    await callback_query.message.answer("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+                else:
+                    enqueued = await enqueue(domain, user_id, short_mode=False)
+                    if enqueued:
+                        await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт.")
+                    else:
+                        await callback_query.message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
                 logging.info(f"Enqueued {domain} for full report due to incomplete cache")
         except Exception as e:
             logging.error(f"Failed to process full report for {domain} by user {user_id}: {str(e)}")
@@ -450,11 +452,10 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
         await message.reply(f"🚫 Вы ограничены на {penalty//60} минут.")
         return
 
-    # Проверяем режим пользователя
     r = await get_redis()
     try:
         user_mode = await r.get(f"mode:{user_id}")
-        short_mode = user_mode != "full"  # По умолчанию краткий режим
+        short_mode = user_mode != "full"
     finally:
         await r.aclose()
 
@@ -506,8 +507,11 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                     await message.answer(f"⚡ Результат из кэша для {domain}:\n\n{cached}")
                 logging.info(f"Returned cached result for {domain} to user {user_id}")
             else:
-                await enqueue(domain, user_id, short_mode=short_mode)
-                await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
+                enqueued = await enqueue(domain, user_id, short_mode=short_mode)
+                if enqueued:
+                    await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на проверку.")
+                else:
+                    await message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
                 logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
     except Exception as e:
         logging.error(f"Failed to process domains for user {user_id}: {str(e)}")
