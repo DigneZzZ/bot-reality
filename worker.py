@@ -184,8 +184,9 @@ async def worker():
                 if result is None:
                     continue  # Очередь пуста, продолжаем ждать
                 _, task = result
+                task = task.decode("utf-8")  # Декодируем байтовую строку
                 logging.info(f"Popped task from queue: {task}")
-                domain, user_id, short_mode = task.decode().split(":")
+                domain, user_id, short_mode = task.split(":")
                 user_id = int(user_id)
                 short_mode = short_mode == "True"
                 result = await check_domain(domain, user_id, short_mode)
