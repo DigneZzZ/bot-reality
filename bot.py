@@ -127,6 +127,7 @@ async def cmd_start(message: types.Message):
         "/full <домен> — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
         "/ping — Убедиться, что бот работает\n"
         "/history — Показать последние 10 проверок\n"
+        "/whoami — Показать ваш Telegram ID\n"
     )
     if is_admin:
         welcome_message += (
@@ -142,6 +143,13 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin))
     logging.info(f"User {user_id} executed /start (is_admin={is_admin})")
+
+@router.message(Command("whoami"))
+async def cmd_whoami(message: types.Message):
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
+    await message.reply(f"Ваш Telegram ID: {user_id}\nАдмин: {'Да' if is_admin else 'Нет'}")
+    logging.info(f"User {user_id} executed /whoami (is_admin={is_admin})")
 
 @router.message(Command("ping"))
 async def cmd_ping(message: types.Message):
@@ -249,9 +257,8 @@ async def cmd_check(message: types.Message):
 @router.message()
 async def handle_domain(message: types.Message):
     text = message.text.strip()
-    if not text:
-        await message.reply("⛔ Укажи валидный домен, например: example.com")
-        return
+    if not text or text.startswith("/"):
+        return  # Игнорируем команды, чтобы не обрабатывать их как домены
     await handle_domain_logic(message, text, short_mode=True)
     logging.info(f"User {message.from_user.id} sent domain: {text}")
 
