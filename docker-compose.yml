@@ -33,7 +33,7 @@ services:
       - BOT_TOKEN=${BOT_TOKEN}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - REDIS_PASSWORD=${ Kathleen
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - ADMIN_ID=${ADMIN_ID}
     depends_on:
       - redis
