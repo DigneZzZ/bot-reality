@@ -12,7 +12,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from redis_queue import get_redis
 from aiogram import Bot
-from bot import get_full_report_button  # Импорт функции
+from bot import get_full_report_button
 
 # Настройка логирования
 log_file = "/app/worker.log"
@@ -268,8 +268,8 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
         full_output += f"⏱️ TTFB: {http_result['ttfb'] or 'неизвестно'}\n"
         full_output += f"🔁 {http_result['redirect']}\n"
         full_output += f"🧾 Сервер: {http_result['server']}\n"
-        full_output += f"🟢 WAF {'не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result['waf']}'}\n"
-        full_output += f"🟢 CDN {'не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result['cdn']}'}\n"
+        full_output += f"🟢 WAF {('не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result["waf"]}')}\n"
+        full_output += f"🟢 CDN {('не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result["cdn"]}')}\n"
         if cname_result["cname"]:
             full_output += f"DNS CNAME: {cname_result['cname']}\n"
         full_output += "\n📄 WHOIS\n"
@@ -291,8 +291,8 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
             output += "    🌐 HTTP\n"
             output += f"{'✅' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else '❌'} {http_result['http_version']} {'поддерживается' if http_result['http_version'] in ['HTTP/2', 'HTTP/3'] else 'не поддерживается'}\n"
             output += f"{'✅ HTTP/3 (h3) поддерживается' if http_result['alt_svc'] and 'h3' in http_result['alt_svc'] else '❌ HTTP/3 не поддерживается'}\n"
-            output += f"🟢 WAF {'не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result['waf']}'}\n"
-            output += f"🟢 CDN {'не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result['cdn']}'}\n"
+            output += f"🟢 WAF {('не обнаружен' if not waf_result['waf'] else f'обнаружен: {waf_result["waf"]}')}\n"
+            output += f"🟢 CDN {('не обнаружен' if not cname_result['cdn'] else f'обнаружен: {cname_result["cdn"]}')}\n"
             output += "    🛰 Оценка пригодности\n"
             output += f"{suitability}\n"
 
