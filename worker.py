@@ -30,19 +30,10 @@ async def process_domain(user_id: int, domain: str, short_mode: bool = False):
             await bot.send_message(user_id, f"❌ Ошибка: пустой отчёт для {domain}")
             return
         if short_mode:
-            lines = result.split("\n")
-            short_result = "\n".join(
-                line for line in lines
-                if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности", "✅", "🟢", "❌"])
-            )
-            if short_result.strip():
-                await bot.send_message(user_id, short_result, reply_markup=get_full_report_button(domain))
-                async with await get_redis() as r:
-                    await r.setex(f"result:{domain}", 86400, short_result)
-            else:
-                await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain))
-                async with await get_redis() as r:
-                    await r.setex(f"result:{domain}", 86400, result)
+            # Краткий отчёт уже сформирован в checker.py
+            await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain))
+            async with await get_redis() as r:
+                await r.setex(f"result:{domain}", 86400, result)
         else:
             await bot.send_message(user_id, result)
             async with await get_redis() as r:
