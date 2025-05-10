@@ -67,7 +67,7 @@ async def check_http_version(domain: str) -> dict:
 
     if result["alt_svc"] and "h3" in result["alt_svc"]:
         result["http_version"] = "HTTP/3"
-        logging.info(f" detected HTTP/3 via alt-svc for {domain}")
+        logging.info(f"Detected HTTP/3 via alt-svc for {domain}")
 
     return result
 
@@ -131,26 +131,32 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
 
     r = await get_redis()
     try:
-        output = f"🔍 Проверка {domain}:\n"
-        output += f"🌐 HTTP: {http_result['http_version']}\n"
+        # Формируем полный отчёт
+        full_output = f"🔍 Проверка {domain}:\n"
+        full_output += f"🌐 HTTP: {http_result['http_version']}\n"
         if http_result["alt_svc"]:
-            output += f"Alt-Svc: {http_result['alt_svc']}\n"
+            full_output += f"Alt-Svc: {http_result['alt_svc']}\n"
         if http_result["error"]:
-            output += f"HTTP Error: {http_result['error']}\n"
+            full_output += f"HTTP Error: {http_result['error']}\n"
         if cname_result["cdn"]:
-            output += f"🛡️ CDN: {cname_result['cdn']}\n"
+            full_output += f"🛡️ CDN: {cname_result['cdn']}\n"
         if cname_result["cname"]:
-            output += f"DNS CNAME: {cname_result['cname']}\n"
+            full_output += f"DNS CNAME: {cname_result['cname']}\n"
         if cname_result["error"]:
-            output += f"CNAME Error: {cname_result['error']}\n"
+            full_output += f"CNAME Error: {cname_result['error']}\n"
         if ports_result["open_ports"]:
-            output += f"🔌 Открытые порты: {', '.join(map(str, ports_result['open_ports']))}\n"
+            full_output += f"🔌 Открытые порты: {', '.join(map(str, ports_result['open_ports']))}\n"
         # Моковые данные для полного отчёта
-        output += f"🌍 География: Неизвестно\n"
-        output += f"📄 WHOIS: Неизвестно\n"
-        output += f"⏱️ TTFB: Неизвестно\n"
-        output += f"🟢 Пригодность: Неизвестно\n"
+        full_output += f"🌍 География: Неизвестно\n"
+        full_output += f"📄 WHOIS: Неизвестно\n"
+        full_output += f"⏱️ TTFB: Неизвестно\n"
+        full_output += f"🟢 Пригодность: Неизвестно\n"
 
+        # Сохраняем полный отчёт в кэш
+        await r.set(f"result:{domain}", full_output, ex=86400)
+
+        # Формируем вывод для пользователя
+        output = full_output
         if short_mode:
             lines = output.split("\n")
             output = "\n".join(
@@ -158,18 +164,17 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
                 if any(k in line for k in ["🔍 Проверка", "🌐 HTTP", "🛡️ CDN", "🔌 Открытые порты", "🟢 Пригодность"])
             )
 
-        await r.set(f"result:{domain}", output, ex=86400)
         await r.lpush(f"history:{user_id}", f"{domain}: {'Краткий' if short_mode else 'Полный'} отчёт")
         await r.ltrim(f"history:{user_id}", 0, 9)
         await r.delete(f"pending:{domain}:{user_id}")
         logging.info(f"Processed {domain} for user {user_id}, short_mode={short_mode}")
+        return output
     except Exception as e:
         logging.error(f"Failed to save result for {domain}: {str(e)}")
         output = f"❌ Ошибка при проверке {domain}: {str(e)}"
+        return output
     finally:
         await r.aclose()
-
-    return output
 
 async def worker():
     logging.info("Starting worker process")
@@ -191,7 +196,7 @@ async def worker():
                 short_mode = short_mode == "True"
                 result = await check_domain(domain, user_id, short_mode)
                 try:
-                    await bot.send_message(user_id, result)
+                    await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain) if short_mode else None)
                     logging.info(f"Sent result for {domain} to user {user_id}")
                 except Exception as e:
                     logging.error(f"Failed to send message to user {user_id} for {domain}: {str(e)}")
