@@ -10,6 +10,7 @@ from time import time
 import re
 from urllib.parse import urlparse
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
 # Настройка логирования
@@ -17,25 +18,26 @@ log_dir = "/app"
 log_file = os.path.join(log_dir, "bot.log")
 fallback_log_file = "/tmp/bot.log"
 os.makedirs(log_dir, exist_ok=True)
+log_handlers = []
+
 try:
     # Проверяем возможность записи в /app
     with open(log_file, "a") as f:
         f.write("")
-    log_handlers = [
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
-    ]
+    # Настраиваем ротацию логов: 10 МБ на файл, максимум 5 файлов
+    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+    log_handlers.append(file_handler)
 except Exception as e:
     # Если не удалось создать /app/bot.log, используем /tmp
     logging.warning(f"Failed to initialize logging to {log_file}: {str(e)}. Falling back to {fallback_log_file}")
     os.makedirs("/tmp", exist_ok=True)
-    log_handlers = [
-        logging.FileHandler(fallback_log_file),
-        logging.StreamHandler()
-    ]
+    file_handler = RotatingFileHandler(fallback_log_file, maxBytes=10*1024*1024, backupCount=5)
+    log_handlers.append(file_handler)
+
+log_handlers.append(logging.StreamHandler())  # Логи в stdout для docker logs
 
 logging.basicConfig(
-    level=logging.DEBUG,  # Увеличиваем уровень для отладки
+    level=logging.INFO,  # INFO для продакшена
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=log_handlers
 )
@@ -130,16 +132,32 @@ def register_violation(user_id):
     user_violations[user_id] = record
     return int(record["until"] - time()) if record["count"] >= 5 else 0
 
-async def check_daily_limit(user_id):
+async def check_rate_limit(user_id: int) -> bool:
+    r = await get_redis()
+    try:
+        key = f"rate:{user_id}:{datetime.now().strftime('%Y%m%d%H%M')}"
+        count = await r.get(key)
+        count = int(count) if count else 0
+        if count >= 10:  # Не более 10 запросов в минуту
+            logging.warning(f"Rate limit exceeded for user {user_id}: {count} requests")
+            return False
+        await r.incr(key)
+        await r.expire(key, 60)  # TTL 1 минута
+        return True
+    finally:
+        await r.aclose()
+
+async def check_daily_limit(user_id: int) -> bool:
     r = await get_redis()
     try:
         key = f"daily:{user_id}:{datetime.now().strftime('%Y%m%d')}"
         count = await r.get(key)
         count = int(count) if count else 0
-        if count >= 100:
+        if count >= 100:  # Не более 100 запросов в день
+            logging.warning(f"Daily limit exceeded for user {user_id}: {count} requests")
             return False
         await r.incr(key)
-        await r.expire(key, 86400)
+        await r.expire(key, 86400)  # TTL 1 день
         return True
     finally:
         await r.aclose()
@@ -154,6 +172,7 @@ async def cmd_start(message: types.Message):
         "📋 <b>Доступные команды:</b>\n"
         "/check \"домен\" — Проверить домен (краткий отчёт, например, <code>/check example.com</code>)\n"
         "/full \"домен\" — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
+        "/mode — Переключить режим вывода (краткий/полный)\n"
         "/ping — Убедиться, что бот работает\n"
         "/history — Показать последние 10 проверок\n"
         "/whoami — Показать ваш Telegram ID\n"
@@ -176,6 +195,23 @@ async def cmd_start(message: types.Message):
     except Exception as e:
         logging.error(f"Failed to send welcome message to user {user_id}: {str(e)}")
         await message.answer("❌ Ошибка при отправке сообщения. Попробуйте позже.")
+
+@router.message(Command("mode"))
+async def cmd_mode(message: types.Message):
+    user_id = message.from_user.id
+    r = await get_redis()
+    try:
+        current_mode = await r.get(f"mode:{user_id}")
+        current_mode = current_mode or "short"
+        new_mode = "full" if current_mode == "short" else "short"
+        await r.set(f"mode:{user_id}", new_mode)
+        await message.reply(f"✅ Режим вывода изменён на: {new_mode}")
+        logging.info(f"User {user_id} changed mode to {new_mode}")
+    except Exception as e:
+        logging.error(f"Failed to change mode for user {user_id}: {str(e)}")
+        await message.reply("❌ Ошибка при смене режима.")
+    finally:
+        await r.aclose()
 
 @router.message(Command("whoami"))
 async def cmd_whoami(message: types.Message):
@@ -286,6 +322,12 @@ async def cmd_check(message: types.Message):
     if not args:
         await message.reply(f"⛔ Укажи домен, например: {command} example.com")
         return
+    if not await check_rate_limit(user_id):
+        await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
+        return
+    if not await check_daily_limit(user_id):
+        await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+        return
     await handle_domain_logic(message, args, short_mode=short_mode)
     logging.info(f"User {user_id} executed {command} with args: {args}")
 
@@ -295,6 +337,12 @@ async def handle_domain(message: types.Message):
     text = message.text.strip()
     if not text or text.startswith("/"):
         logging.debug(f"Ignoring command or empty message from user {user_id}: {text}")
+        return
+    if not await check_rate_limit(user_id):
+        await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
+        return
+    if not await check_daily_limit(user_id):
+        await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
         return
     await handle_domain_logic(message, text, short_mode=True)
     logging.info(f"User {user_id} sent domain: {text}")
@@ -402,13 +450,13 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
         await message.reply(f"🚫 Вы ограничены на {penalty//60} минут.")
         return
 
-    if not await check_daily_limit(user_id):
-        await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
-        return
-
-    if rate_limited(user_id):
-        await message.reply("🚫 Слишком много запросов. Не более 10 проверок за 30 секунд.")
-        return
+    # Проверяем режим пользователя
+    r = await get_redis()
+    try:
+        user_mode = await r.get(f"mode:{user_id}")
+        short_mode = user_mode != "full"  # По умолчанию краткий режим
+    finally:
+        await r.aclose()
 
     domains = [d.strip() for d in re.split(r'[,\n]', input_text) if d.strip()]
     if not domains:
@@ -448,7 +496,7 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                     lines = cached.split("\n")
                     cached = "\n".join(
                         line for line in lines
-                        if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛰 Оценка пригодности", "✅", "🟢", "❌"])
+                        if any(k in line for k in ["🔍 Проверка", "🔒 TLS", "🌐 HTTP", "🛡️ CDN", "🔌 Открытые порты", "✅", "🟢", "❌"])
                     )
                     await message.answer(
                         f"⚡ Результат из кэша для {domain}:\n\n{cached}",
