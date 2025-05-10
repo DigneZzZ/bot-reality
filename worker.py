@@ -113,9 +113,21 @@ async def scan_ports(domain: str, ports: list = [80, 443, 8080], timeout: float 
 
 async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
     logging.info(f"Starting check for {domain} for user {user_id}, short_mode={short_mode}")
-    http_result = await check_http_version(domain)
-    cname_result = await check_cname(domain)
-    ports_result = await scan_ports(domain)
+    try:
+        async with asyncio.timeout(300):  # Таймаут 5 минут
+            http_result = await check_http_version(domain)
+            cname_result = await check_cname(domain)
+            ports_result = await scan_ports(domain)
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout while checking {domain} for user {user_id}")
+        output = f"❌ Проверка {domain} прервана: превышено время ожидания (5 минут)."
+        r = await get_redis()
+        try:
+            await r.delete(f"pending:{domain}:{user_id}")
+            logging.info(f"Removed pending flag for {domain} for user {user_id} due to timeout")
+        finally:
+            await r.aclose()
+        return output
 
     r = await get_redis()
     try:
@@ -168,18 +180,20 @@ async def worker():
         logging.info("Successfully connected to Redis")
         while True:
             try:
-                _, task = await r.brpop("queue:domains", timeout=5)
-                if task:
-                    logging.info(f"Popped task from queue: {task}")
-                    domain, user_id, short_mode = task.split(":")
-                    user_id = int(user_id)
-                    short_mode = short_mode == "True"
-                    result = await check_domain(domain, user_id, short_mode)
-                    try:
-                        await bot.send_message(user_id, result)
-                        logging.info(f"Sent result for {domain} to user {user_id}")
-                    except Exception as e:
-                        logging.error(f"Failed to send message to user {user_id} for {domain}: {str(e)}")
+                result = await r.brpop("queue:domains", timeout=5)
+                if result is None:
+                    continue  # Очередь пуста, продолжаем ждать
+                _, task = result
+                logging.info(f"Popped task from queue: {task}")
+                domain, user_id, short_mode = task.decode().split(":")
+                user_id = int(user_id)
+                short_mode = short_mode == "True"
+                result = await check_domain(domain, user_id, short_mode)
+                try:
+                    await bot.send_message(user_id, result)
+                    logging.info(f"Sent result for {domain} to user {user_id}")
+                except Exception as e:
+                    logging.error(f"Failed to send message to user {user_id} for {domain}: {str(e)}")
             except Exception as e:
                 logging.error(f"Worker error: {str(e)}")
                 await asyncio.sleep(1)
