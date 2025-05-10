@@ -3,17 +3,27 @@ from aiogram import Bot, Router, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
+import redis.asyncio as redis
 from redis_queue import enqueue, get_redis
 from collections import defaultdict
 from time import time
-import redis.asyncio as redis
 import re
 from urllib.parse import urlparse
 import logging
 from datetime import datetime
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, filename="bot.log", format="%(asctime)s - %(levelname)s - %(message)s")
+log_dir = "/app"
+log_file = os.path.join(log_dir, "bot.log")
+os.makedirs(log_dir, exist_ok=True)  # Создаём директорию, если не существует
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()  # Дублируем логи в stdout для docker logs
+    ]
+)
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -120,6 +130,7 @@ async def check_daily_limit(user_id):
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
+    logging.info(f"Processing /start for user {user_id} (is_admin={is_admin})")
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
@@ -142,7 +153,7 @@ async def cmd_start(message: types.Message):
         "🚀 Выбери действие ниже!"
     )
     await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin))
-    logging.info(f"User {user_id} executed /start (is_admin={is_admin})")
+    logging.info(f"Sent welcome message to user {user_id} (is_admin={is_admin})")
 
 @router.message(Command("whoami"))
 async def cmd_whoami(message: types.Message):
@@ -153,8 +164,9 @@ async def cmd_whoami(message: types.Message):
 
 @router.message(Command("ping"))
 async def cmd_ping(message: types.Message):
+    user_id = message.from_user.id
     await message.reply("🏓 Я жив!")
-    logging.info(f"User {message.from_user.id} executed /ping")
+    logging.info(f"User {user_id} executed /ping")
 
 @router.message(Command("history"))
 async def cmd_history(message: types.Message):
@@ -245,6 +257,7 @@ async def cmd_export_approved(message: types.Message):
 
 @router.message(Command("check", "full"))
 async def cmd_check(message: types.Message):
+    user_id = message.from_user.id
     command = message.get_command()
     short_mode = command == "/check"
     args = message.get_args().strip()
@@ -252,20 +265,23 @@ async def cmd_check(message: types.Message):
         await message.reply(f"⛔ Укажи домен, например: {command} example.com")
         return
     await handle_domain_logic(message, args, short_mode=short_mode)
-    logging.info(f"User {message.from_user.id} executed {command} with args: {args}")
+    logging.info(f"User {user_id} executed {command} with args: {args}")
 
 @router.message()
 async def handle_domain(message: types.Message):
+    user_id = message.from_user.id
     text = message.text.strip()
     if not text or text.startswith("/"):
-        return  # Игнорируем команды, чтобы не обрабатывать их как домены
+        logging.debug(f"Ignoring command or empty message from user {user_id}: {text}")
+        return
     await handle_domain_logic(message, text, short_mode=True)
-    logging.info(f"User {message.from_user.id} sent domain: {text}")
+    logging.info(f"User {user_id} sent domain: {text}")
 
 @router.callback_query()
 async def process_callback(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
     is_admin = user_id == ADMIN_ID
+    logging.info(f"Processing callback {callback_query.data} for user {user_id} (is_admin={is_admin})")
     if callback_query.data == "check":
         await callback_query.message.answer("⛔ Укажи домен, например: /check example.com")
     elif callback_query.data == "full":
@@ -433,7 +449,9 @@ async def main():
     from aiogram import Dispatcher
     dp = Dispatcher()
     dp.include_router(router)
+    logging.info("Starting bot polling...")
     await dp.start_polling(bot)
+    logging.info("Bot polling stopped.")
 
 if __name__ == "__main__":
     asyncio.run(main())
