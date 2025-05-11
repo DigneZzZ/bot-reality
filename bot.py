@@ -47,8 +47,8 @@ router = Router()
 
 def get_main_keyboard(is_admin: bool):
     buttons = [
-        [InlineKeyboardButton(text="Переключить режим", callback_data="mode")],
-        [InlineKeyboardButton(text="История", callback_data="history")]
+        [InlineKeyboardButton(text="Смена вывода full / short", callback_data="mode")],
+        [InlineKeyboardButton(text="История запросов", callback_data="history")]
     ]
     if is_admin:
         buttons.extend([
