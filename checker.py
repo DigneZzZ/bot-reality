@@ -265,7 +265,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
     # WAF и CDN
     waf_result = detect_waf(http.get("server"))
     cdn = detect_cdn(http, get_ip_info(ip)[1])
-    cdn_result = f"🟢 CDN {('не обнаружен' if not cdn else f'обнаружен: {cdn.capitalize()}')}"
+    cdn_result = f"{('🟢 CDN не обнаружен' if not cdn else f'⚠️ CDN обнаружен: {cdn.capitalize()}')}"
 
     # Оценка пригодности
     suitability_results = []
