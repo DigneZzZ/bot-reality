@@ -269,16 +269,25 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
 
     # Оценка пригодности
     suitability_results = []
+    reasons = []
+
+    # Проверяем условия
+    if not http["http2"]:
+        reasons.append("HTTP/2 отсутствует")
+    if tls["tls"] not in ["TLSv1.3", "TLS 1.3"]:
+        reasons.append("TLS 1.3 отсутствует")
+    if ping_ms and ping_ms >= ping_threshold:
+        reasons.append(f"высокий пинг ({ping_ms:.1f} ms)")
     if cdn:
-        suitability_results.append(f"❌ Не пригоден: CDN обнаружен ({cdn.capitalize()})")
-    elif not http["http2"]:
-        suitability_results.append("❌ Не пригоден: HTTP/2 отсутствует")
-    elif tls["tls"] not in ["TLSv1.3", "TLS 1.3"]:
-        suitability_results.append("❌ Не пригоден: TLS 1.3 отсутствует")
-    elif ping_ms and ping_ms >= ping_threshold:
-        suitability_results.append(f"❌ Не пригоден: высокий пинг ({ping_ms:.1f} ms)")
-    else:
+        reasons.append(f"CDN обнаружен ({cdn.capitalize()})")
+
+    # Формируем оценку
+    if not reasons:  # Все условия выполнены
         suitability_results.append("✅ Пригоден для Reality")
+    elif reasons == [f"CDN обнаружен ({cdn.capitalize()})"]:  # Только CDN обнаружен
+        suitability_results.append(f"⚠️ Условно пригоден: CDN обнаружен ({cdn.capitalize()})")
+    else:  # Есть другие проблемы
+        suitability_results.append(f"❌ Не пригоден: {', '.join(reasons)}")
 
     if not full_report:
         # Краткий отчёт
