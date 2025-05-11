@@ -581,10 +581,23 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
             if cached and (short_mode or is_full_report):
                 if short_mode:
                     lines = cached.split("\n")
-                    filtered = "\n".join(
-                        line for line in lines
-                        if any(k in line for k in ["🔍 Проверка", "🌐 HTTP", "🛡️ CDN", "🔌 Открытые порты", "🟢 Пригодность"])
-                    )
+                    filtered_lines = []
+                    include_next = False
+                    for line in lines:
+                        # Включаем заголовок
+                        if "🔍 Проверка" in line:
+                            filtered_lines.append(line)
+                            continue
+                        # Включаем строки с ключевыми словами и следующие за ними
+                        if any(k in line for k in ["🟢 Ping", "🔒 TLS", "🌐 HTTP", "🛡", "🟢 CDN", "🛰 Оценка пригодности"]):
+                            filtered_lines.append(line)
+                            include_next = True  # Включаем следующую строку (например, после "🔒 TLS")
+                        elif include_next and line.strip().startswith(("✅", "❌", "⏳")):
+                            filtered_lines.append(line)
+                            include_next = False
+                        else:
+                            include_next = False
+                    filtered = "\n".join(filtered_lines)
                     await message.answer(
                         f"⚡ Результат из кэша для {domain}:\n\n{filtered}",
                         reply_markup=get_full_report_button(domain)
