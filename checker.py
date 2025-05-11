@@ -165,15 +165,34 @@ def check_spamhaus(ip):
         return f"❌ Spamhaus: ошибка ({str(e)})"
 
 def detect_cdn(http_info, asn):
-    """Проверяет наличие CDN на основе заголовков, ASN и других признаков."""
+    """Проверяет наличие CDN на основе заголовков, ASN и дополнительных данных."""
     headers_str = " ".join(f"{k}:{v}" for k, v in http_info.get("headers", {}).items() if v).lower()
     server = http_info.get("server", "N/A") or "N/A"
     text = f"{server} {headers_str}".lower()
+
+    # Анализируем ASN
+    asn_text = (asn or "").lower()
+    
+    # Собираем данные для поиска паттернов
+    combined_text = text + " " + asn_text
+
+    # Дополнительный запрос к ipinfo.io для получения организации (как в bash-скрипте)
+    try:
+        ip = socket.gethostbyname(http_info.get("domain", ""))  # Предполагаем, что domain доступен в http_info
+        ipinfo_org = requests.get(f"https://ipinfo.io/{ip}/org", timeout=5).text.lower()
+        combined_text += " " + ipinfo_org
+    except Exception as e:
+        logging.warning(f"Failed to fetch ipinfo.org for {ip}: {str(e)}")
+
+    # Поиск по паттернам
     for pat in CDN_PATTERNS:
-        if pat in text:
+        if pat in combined_text:
             return pat
+
+    # Специфическая проверка для Google (ASN 15169)
     if asn and re.search(r"\b15169\b", asn):
         return "google"
+
     return None
 
 def detect_waf(server):
@@ -227,6 +246,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
 
     # HTTP
     http = get_http_info(domain, timeout=http_timeout)
+    http["domain"] = domain
     http_results = [
         "✅ HTTP/2 поддерживается" if http["http2"] else "❌ HTTP/2 не поддерживается",
         "✅ HTTP/3 (h3) поддерживается" if http["http3"] else "❌ HTTP/3 не поддерживается"
