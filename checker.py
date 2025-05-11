@@ -165,7 +165,7 @@ def check_spamhaus(ip):
         return f"❌ Spamhaus: ошибка ({str(e)})"
 
 def detect_cdn(http_info, asn):
-    """Проверяет наличие CDN на основе заголовков, ASN и дополнительных данных."""
+    """Проверяет наличие CDN на основе заголовков, ASN и дополнительных данных с приоритетом популярных провайдеров."""
     headers_str = " ".join(f"{k}:{v}" for k, v in http_info.get("headers", {}).items() if v).lower()
     server = http_info.get("server", "N/A") or "N/A"
     text = f"{server} {headers_str}".lower()
@@ -176,22 +176,36 @@ def detect_cdn(http_info, asn):
     # Собираем данные для поиска паттернов
     combined_text = text + " " + asn_text
 
-    # Дополнительный запрос к ipinfo.io для получения организации (как в bash-скрипте)
+    # Дополнительный запрос к ipinfo.io
     try:
-        ip = socket.gethostbyname(http_info.get("domain", ""))  # Предполагаем, что domain доступен в http_info
+        ip = socket.gethostbyname(http_info.get("domain", ""))
         ipinfo_org = requests.get(f"https://ipinfo.io/{ip}/org", timeout=5).text.lower()
         combined_text += " " + ipinfo_org
     except Exception as e:
         logging.warning(f"Failed to fetch ipinfo.org for {ip}: {str(e)}")
 
-    # Поиск по паттернам
-    for pat in CDN_PATTERNS:
+    # Приоритетные популярные CDN (проверка по ASN и тексту)
+    priority_cdns = [
+        ("google", r"\b15169\b"),    # Google
+        ("cloudflare", r"\b13335\b"), # Cloudflare
+        ("fastly", r"\b54113\b"),    # Fastly
+        ("amazon", r"\b16509\b"),    # Amazon CloudFront
+        ("akamai", r"\b16625\b"),    # Akamai
+    ]
+    for cdn_name, asn_pattern in priority_cdns:
+        if asn and re.search(asn_pattern, asn):
+            return cdn_name
+        if cdn_name in combined_text:
+            return cdn_name
+
+    # Оставшиеся паттерны из CDN_PATTERNS
+    remaining_patterns = [
+        pat for pat in CDN_PATTERNS
+        if pat not in [cdn for cdn_name, _ in priority_cdns]
+    ]
+    for pat in remaining_patterns:
         if pat in combined_text:
             return pat
-
-    # Специфическая проверка для Google (ASN 15169)
-    if asn and re.search(r"\b15169\b", asn):
-        return "google"
 
     return None
 
