@@ -409,6 +409,20 @@ async def process_callback(callback_query: types.CallbackQuery):
     elif callback_query.data == "ping":
         await callback_query.message.answer("🏓 Я жив!")
         logging.info(f"User {user_id} triggered ping callback")
+    elif callback_query.data == "mode":
+        r = await get_redis()
+        try:
+            current_mode = await r.get(f"mode:{user_id}")
+            current_mode = current_mode or "short"
+            new_mode = "full" if current_mode == "short" else "short"
+            await r.set(f"mode:{user_id}", new_mode)
+            await callback_query.message.reply(f"✅ Режим вывода изменён на: {new_mode}")
+            logging.info(f"User {user_id} changed mode to {new_mode} via callback")
+        except Exception as e:
+            logging.error(f"Failed to change mode for user {user_id} via callback: {str(e)}")
+            await callback_query.message.reply("❌ Ошибка при смене режима.")
+        finally:
+            await r.aclose()
     elif callback_query.data == "history":
         r = await get_redis()
         try:
@@ -443,6 +457,24 @@ async def process_callback(callback_query: types.CallbackQuery):
             await callback_query.message.reply("❌ Ошибка при получении списка доменов.")
         finally:
             await r.aclose()
+            
+    elif callback_query.data == "clearcache" and is_admin:
+        r = await get_redis()
+        try:
+            keys = await r.keys("result:*")
+            if keys:
+                await r.delete(*keys)
+                await callback_query.message.reply(f"✅ Кэш очищен. Удалено {len(keys)} записей.")
+                logging.info(f"Admin {user_id} cleared {len(keys)} result keys via callback")
+            else:
+                await callback_query.message.reply("✅ Кэш уже пуст.")
+                logging.info(f"Admin {user_id} attempted to clear cache via callback, but it was empty")
+        except Exception as e:
+            logging.error(f"Failed to clear cache via callback for user {user_id}: {str(e)}")
+            await callback_query.message.reply(f"❌ Ошибка при очистке кэша: {str(e)}")
+        finally:
+            await r.aclose()
+
     elif callback_query.data == "clear_approved" and is_admin:
         r = await get_redis()
         try:
