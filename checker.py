@@ -278,14 +278,19 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
     
     # WAF и CDN
     waf_result = detect_waf(http.get("server"))
-    cdn = cdn if 'cdn' in locals() else None
-    cdn = detect_cdn(http, get_ip_info(ip)[1])
-    cdn_result = f"{('🟢 CDN не обнаружен' if not cdn else f'⚠️ CDN обнаружен: {cdn.capitalize()}')}"
-
+    cdn = None
+    try:
+        _, asn = get_ip_info(ip)
+        cdn = detect_cdn(http, asn)
+    except Exception as e:
+        logging.warning(f"CDN detection failed for {domain}: {str(e)}")
+    
+    cdn_result = f"{'🟢 CDN не обнаружен' if not cdn else f'⚠️ CDN обнаружен: {cdn.capitalize()}'}"
+    
     # Оценка пригодности
     suitability_results = []
     reasons = []
-
+    
     # Проверяем условия
     if not http["http2"]:
         reasons.append("HTTP/2 отсутствует")
@@ -295,7 +300,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         reasons.append(f"высокий пинг ({ping_ms:.1f} ms)")
     if cdn:
         reasons.append(f"CDN обнаружен ({cdn.capitalize()})")
-
+    
     # Формируем оценку
     if not reasons:  # Все условия выполнены
         suitability_results.append("✅ Пригоден для Reality")
@@ -303,6 +308,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         suitability_results.append(f"⚠️ Условно пригоден: CDN обнаружен ({cdn.capitalize()})")
     else:  # Есть другие проблемы
         suitability_results.append(f"❌ Не пригоден: {', '.join(reasons)}")
+
 
     if not full_report:
         # Краткий отчёт
