@@ -275,23 +275,23 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
     else:
         http_additional.append("🔁 Без редиректа")
     http_additional.append(fingerprint_server(http.get("server")))
-    
-    # WAF и CDN
-    waf_result = detect_waf(http.get("server"))
+
+    # ↓↓↓ ASN и CDN определяются один раз ↓↓↓
+    loc, asn = "N/A", "N/A"
     cdn = None
     try:
-        _, asn = get_ip_info(ip)
+        loc, asn = get_ip_info(ip)
         cdn = detect_cdn(http, asn)
     except Exception as e:
         logging.warning(f"CDN detection failed for {domain}: {str(e)}")
-    
+
+    waf_result = detect_waf(http.get("server"))
     cdn_result = f"{'🟢 CDN не обнаружен' if not cdn else f'⚠️ CDN обнаружен: {cdn.capitalize()}'}"
-    
+
     # Оценка пригодности
     suitability_results = []
     reasons = []
-    
-    # Проверяем условия
+
     if not http["http2"]:
         reasons.append("HTTP/2 отсутствует")
     if tls["tls"] not in ["TLSv1.3", "TLS 1.3"]:
@@ -300,15 +300,13 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         reasons.append(f"высокий пинг ({ping_ms:.1f} ms)")
     if cdn:
         reasons.append(f"CDN обнаружен ({cdn.capitalize()})")
-    
-    # Формируем оценку
-    if not reasons:  # Все условия выполнены
-        suitability_results.append("✅ Пригоден для Reality")
-    elif cdn and reasons == [f"CDN обнаружен ({cdn.capitalize()})"]:  # Только CDN обнаружен
-        suitability_results.append(f"⚠️ Условно пригоден: CDN обнаружен ({cdn.capitalize()})")
-    else:  # Есть другие проблемы
-        suitability_results.append(f"❌ Не пригоден: {', '.join(reasons)}")
 
+    if not reasons:
+        suitability_results.append("✅ Пригоден для Reality")
+    elif cdn and reasons == [f"CDN обнаружен ({cdn.capitalize()})"]:
+        suitability_results.append(f"⚠️ Условно пригоден: CDN обнаружен ({cdn.capitalize()})")
+    else:
+        suitability_results.append(f"❌ Не пригоден: {', '.join(reasons)}")
 
     if not full_report:
         # Краткий отчёт
@@ -325,30 +323,29 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         # Полный отчёт
         report.append("\n🌐 DNS")
         report.append(f"✅ A: {ip}" if ip else "❌ DNS: не разрешается")
-        
+
         report.append("\n📡 Скан портов")
         report += scan_ports(ip, timeout=port_timeout)
-        
+
         report.append("\n🌍 География и ASN")
-        loc, asn = get_ip_info(ip)
         report.append(f"📍 IP: {loc}")
         report.append(f"🏢 ASN: {asn}")
         report.append(check_spamhaus(ip))
         report.append(ping_result)
-        
+
         report.append("\n🔒 TLS")
         report += tls_results
-        
+
         report.append("\n🌐 HTTP")
         report += http_results
         report += http_additional
         report.append(waf_result)
         report.append(cdn_result)
-        
+
         report.append("\n📄 WHOIS")
         whois_exp = get_domain_whois(domain)
         report.append(f"📆 Срок действия: {whois_exp}" if whois_exp else "❌ WHOIS: ошибка")
-        
+
         report.append("\n🛰 Оценка пригодности")
         report += suitability_results
 
