@@ -47,9 +47,7 @@ router = Router()
 
 def get_main_keyboard(is_admin: bool):
     buttons = [
-        [InlineKeyboardButton(text="Проверить домен", callback_data="check")],
-        [InlineKeyboardButton(text="Полный отчёт", callback_data="full")],
-        [InlineKeyboardButton(text="Пинг", callback_data="ping")],
+        [InlineKeyboardButton(text="Переключить режим", callback_data="mode")],
         [InlineKeyboardButton(text="История", callback_data="history")]
     ]
     if is_admin:
@@ -57,7 +55,8 @@ def get_main_keyboard(is_admin: bool):
             [InlineKeyboardButton(text="Список пригодных доменов", callback_data="approved")],
             [InlineKeyboardButton(text="Очистить список доменов", callback_data="clear_approved")],
             [InlineKeyboardButton(text="Экспортировать домены", callback_data="export_approved")],
-            [InlineKeyboardButton(text="Сбросить очередь", callback_data="reset_queue")]
+            [InlineKeyboardButton(text="Сбросить очередь", callback_data="reset_queue")],
+            [InlineKeyboardButton(text="Очистить кэш результатов", callback_data="clearcache")]
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -163,19 +162,16 @@ async def cmd_start(message: types.Message):
     is_admin = user_id == ADMIN_ID
     logging.debug(f"Processing /start for user {user_id} (is_admin={is_admin})")
     welcome_message = (
-        "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для прокси и Reality.\n\n"
+        "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
-        "/check \"домен\" — Проверить домен (краткий отчёт, например, <code>/check example.com</code>)\n"
-        "/full \"домен\" — Проверить домен (полный отчёт, например, <code>/full example.com</code>)\n"
         "/mode — Переключить режим вывода (краткий/полный)\n"
-        "/ping — Убедиться, что бот работает\n"
         "/history — Показать последние 10 проверок\n"
-        "/whoami — Показать ваш Telegram ID\n"
-        "/reset_queue — Сбросить очередь (только для админа)\n"
+
     )
     if is_admin:
         welcome_message += (
             "\n🔧 <b>Админ-команды:</b>\n"
+            "/reset_queue — Сбросить очередь (только для админа)\n"
             "/approved — Показать список пригодных доменов\n"
             "/clear_approved — Очистить список пригодных доменов\n"
             "/export_approved — Экспортировать список доменов в файл\n"
@@ -185,7 +181,10 @@ async def cmd_start(message: types.Message):
     welcome_message += (
         "\n📩 Можно отправить несколько доменов (через запятую или перенос строки), например:\n"
         "<code>example.com, google.com</code>\n"
-        "🚀 Выбери действие ниже!"
+        "Дневной лимит 100 проверок на пользователя\n"
+        "🚀 Выбери действие ниже!\n\n"
+        "Разработка при участии ИИ и проекта OpeNode.xyz"
+        
     )
     try:
         await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin))
@@ -211,18 +210,6 @@ async def cmd_mode(message: types.Message):
     finally:
         await r.aclose()
 
-@router.message(Command("whoami"))
-async def cmd_whoami(message: types.Message):
-    user_id = message.from_user.id
-    is_admin = user_id == ADMIN_ID
-    await message.reply(f"Ваш Telegram ID: {user_id}\nАдмин: {'Да' if is_admin else 'Нет'}")
-    logging.info(f"User {user_id} executed /whoami (is_admin={is_admin})")
-
-@router.message(Command("ping"))
-async def cmd_ping(message: types.Message):
-    user_id = message.from_user.id
-    await message.reply("🏓 Я жив!")
-    logging.info(f"User {user_id} executed /ping")
 
 @router.message(Command("history"))
 async def cmd_history(message: types.Message):
