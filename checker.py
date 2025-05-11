@@ -51,24 +51,37 @@ def get_ping(ip, timeout=1):
         logging.error(f"Ping failed for {ip}: {str(e)}")
         return None
 
-def get_tls_info(domain, port, timeout=5):
+def get_tls_info(domain, port, timeout=10):
     """Проверяет TLS: версию, шифр, срок действия сертификата."""
     info = {"tls": None, "cipher": None, "expires_days": None, "error": None}
     try:
+        # Разрешаем IP домена
+        ip = socket.gethostbyname(domain)
+        logging.info(f"Resolved {domain} to IP: {ip}")
+        
+        # Создаем контекст TLS с минимальной версией TLSv1.3
         ctx = ssl.create_default_context()
-        with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
-            s.settimeout(timeout)
-            s.connect((domain, port))
-            info["tls"] = s.version()
-            info["cipher"] = s.cipher()[0]
-            cert = s.getpeercert()
-            expire = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-            info["expires_days"] = (expire - datetime.utcnow()).days
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3  # Принудительно TLSv1.3
+        ctx.set_ciphers("DEFAULT")  # Используем стандартные шифры
+
+        # Создаем сокет и устанавливаем таймаут
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_socket:
+            raw_socket.settimeout(timeout)
+            # Оборачиваем сокет в TLS с указанием SNI
+            with ctx.wrap_socket(raw_socket, server_hostname=domain) as s:
+                logging.info(f"Attempting TLS connection to {ip}:{port} with SNI={domain}")
+                s.connect((ip, port))  # Подключаемся напрямую к IP
+                info["tls"] = s.version()
+                info["cipher"] = s.cipher()[0] if s.cipher() else None
+                cert = s.getpeercert()
+                expire = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                info["expires_days"] = (expire - datetime.utcnow()).days
+                logging.info(f"TLS connection successful: {info['tls']}, cipher: {info['cipher']}")
     except Exception as e:
         info["error"] = str(e)
         logging.error(f"TLS check failed for {domain}:{port}: {str(e)}")
     return info
-
+    
 def get_http_info(domain, timeout=20.0):
     """Проверяет HTTP: HTTP/2, HTTP/3, TTFB, редиректы, сервер."""
     info = {"http2": False, "http3": False, "server": "N/A", "ttfb": None, "redirect": None, "error": None, "headers": {}}
