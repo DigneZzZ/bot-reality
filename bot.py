@@ -343,22 +343,44 @@ async def cmd_start(message: Message, command: Optional[CommandObject] = None):
 async def cmd_help(message: Message):
     if not message.from_user: return
     is_admin = message.from_user.id == ADMIN_ID
+    is_group = is_group_chat(message)
     
-    help_text = (
-        "<b>Основные команды:</b>\n"
-        "/start - Начало работы\n"
-        "/mode - Сменить режим вывода\n"
-        "/history - Последние 10 проверок\n"
-        "/check [домен] - Краткая проверка\n"
-        "/full [домен] - Полная проверка\n"
-    )
-    if is_admin:
-        help_text += "\n<b>Админ-команды:</b> /admin"
+    if is_group:
+        # Команды для групповых чатов
+        help_text = (
+            "<b>Команды для групп:</b>\n"
+            "/start - Начало работы\n"
+            "/help - Показать эту справку\n"
+            "/check [домен] - Краткая проверка\n"
+            "/full [домен] - Полная проверка\n\n"
+            f"<i>💡 Префикс команд: {GROUP_COMMAND_PREFIX}</i>\n"
+            f"<i>📊 Режим вывода: {GROUP_OUTPUT_MODE}</i>"
+        )
+    else:
+        # Команды для личных сообщений
+        help_text = (
+            "<b>Основные команды:</b>\n"
+            "/start - Начало работы\n"
+            "/help - Показать эту справку\n"
+            "/mode - Сменить режим вывода\n"
+            "/history - Последние 10 проверок\n"
+            "/check [домен] - Краткая проверка\n"
+            "/full [домен] - Полная проверка\n"
+        )
+        if is_admin:
+            help_text += "\n<b>Админ-команды:</b> /admin"
+    
     await send_topic_aware_message(message, help_text)
 
 @router.message(Command("mode"))
 async def cmd_mode(message: Message):
     if not message.from_user: return
+    
+    # Команда /mode работает только в личных сообщениях
+    if is_group_chat(message):
+        await send_topic_aware_message(message, "⛔ Команда /mode доступна только в личных сообщениях с ботом. В группах используется настройка GROUP_OUTPUT_MODE.")
+        return
+        
     user_id = message.from_user.id
     r = await get_redis_connection()
     try:
@@ -372,6 +394,12 @@ async def cmd_mode(message: Message):
 @router.message(Command("history"))
 async def cmd_history(message: Message):
     if not message.from_user: return
+    
+    # Команда /history работает только в личных сообщениях
+    if is_group_chat(message):
+        await send_topic_aware_message(message, "⛔ Команда /history доступна только в личных сообщениях с ботом.")
+        return
+        
     user_id = message.from_user.id
     r = await get_redis_connection()
     try:
@@ -428,6 +456,12 @@ async def is_admin_check(query_or_message: Union[Message, CallbackQuery]) -> boo
         else:
             await query_or_message.answer(text, show_alert=True)
         return False
+    
+    # Админ-команды работают только в ЛС
+    if isinstance(query_or_message, Message) and is_group_chat(query_or_message):
+        await send_topic_aware_message(query_or_message, "⛔ Админ-команды доступны только в личных сообщениях с ботом.")
+        return False
+        
     return True
 
 @router.message(Command("admin"))
