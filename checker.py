@@ -99,7 +99,8 @@ def get_http_info(domain, timeout=20.0):
     
     try:
         start = time.time()
-        with httpx.Client(timeout=timeout, verify=False, follow_redirects=False) as client:
+        # Включаем поддержку HTTP/2 в httpx
+        with httpx.Client(timeout=timeout, verify=False, follow_redirects=False, http2=True) as client:
             response = client.get(f"https://{domain}")
             info["ttfb"] = time.time() - start
             info["http2"] = response.http_version == "HTTP/2"
