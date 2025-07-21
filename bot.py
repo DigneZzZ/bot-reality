@@ -105,15 +105,20 @@ analytics_collector = None
 # --- Redis Connection ---
 async def get_redis_connection() -> redis.Redis:
     try:
-        return redis.Redis(
+        logging.info("Attempting to connect to Redis...")
+        connection = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6379")),
             password=os.getenv("REDIS_PASSWORD"),
             decode_responses=True,
             retry_on_timeout=True
         )
+        # Проверяем соединение
+        await connection.ping()
+        logging.info("✅ Redis connection successful")
+        return connection
     except Exception as e:
-        logging.error(f"Failed to connect to Redis: {e}")
+        logging.error(f"❌ Failed to connect to Redis: {e}")
         raise
 
 # --- Analytics ---
@@ -259,12 +264,16 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
     is_group = is_group_chat(message)
     chat_id = message.chat.id if is_group else None
 
+    logging.info(f"handle_domain_logic: user={user_id}, text='{text}', short_mode={short_mode}, is_group={is_group}")
+
     if not await check_limits(user_id, is_group, chat_id):
         await send_topic_aware_message(message, "🚫 Превышен лимит запросов. Попробуйте позже.")
         return
 
     domains = re.split(r'[\s,]+', text)
     valid_domains = {d for d in (extract_domain(d) for d in domains) if d}
+
+    logging.info(f"Valid domains extracted: {valid_domains}")
 
     if not valid_domains:
         await send_topic_aware_message(message, "❌ Не найдено ни одного корректного домена для проверки.")
@@ -275,18 +284,39 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
         user_mode_is_short = (await r.get(f"mode:{user_id}")) != "full"
         final_short_mode = short_mode and user_mode_is_short
 
+        logging.info(f"User mode: {'short' if user_mode_is_short else 'full'}, final_short_mode: {final_short_mode}")
+
         for domain in valid_domains:
-            cached_result = await r.get(f"result:{domain}")
-            if cached_result and (not final_short_mode or "краткий" in cached_result.lower()):
-                keyboard = get_full_report_button(domain) if final_short_mode and not is_group else None
-                if is_group: keyboard = get_group_full_report_button(domain)
-                await send_topic_aware_message(message, cached_result, reply_markup=keyboard)
-            else:
-                await enqueue(domain, user_id, final_short_mode, message.chat.id, message.message_id, message.message_thread_id)
-                await send_topic_aware_message(message, f"✅ Домен <b>{domain}</b> добавлен в очередь на проверку.")
-            await log_analytics("domain_check", user_id, domain=domain, mode="short" if final_short_mode else "full")
+            try:
+                cached_result = await r.get(f"result:{domain}")
+                logging.info(f"Domain {domain}: cached_result exists: {bool(cached_result)}")
+                if cached_result and (not final_short_mode or "краткий" in cached_result.lower()):
+                    # Показываем кнопку "Полный отчёт" только если это краткий режим
+                    keyboard = None
+                    if final_short_mode:
+                        if is_group:
+                            keyboard = get_group_full_report_button(domain)
+                            logging.info(f"Using group keyboard for {domain}")
+                        else:
+                            keyboard = get_full_report_button(domain)
+                            logging.info(f"Using private keyboard for {domain}")
+                    await send_topic_aware_message(message, cached_result, reply_markup=keyboard)
+                else:
+                    logging.info(f"Enqueueing domain {domain} for processing")
+                    await enqueue(domain, user_id, final_short_mode, message.chat.id, message.message_id, message.message_thread_id)
+                    await send_topic_aware_message(message, f"✅ Домен <b>{domain}</b> добавлен в очередь на проверку.")
+                await log_analytics("domain_check", user_id, domain=domain, mode="short" if final_short_mode else "full")
+            except Exception as e:
+                logging.error(f"Error processing domain {domain}: {e}")
+                await send_topic_aware_message(message, f"❌ Ошибка при обработке домена {domain}: {e}")
+    except Exception as redis_error:
+        logging.error(f"Redis connection error: {redis_error}")
+        await send_topic_aware_message(message, "❌ Ошибка подключения к базе данных. Попробуйте позже.")
     finally:
-        await r.aclose()
+        try:
+            await r.aclose()
+        except Exception:
+            pass
 
 # --- Message Handlers ---
 @router.message(CommandStart())
@@ -295,30 +325,39 @@ async def cmd_start(message: Message, command: Optional[CommandObject] = None):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
 
+    logging.info(f"cmd_start called by user {user_id}, command: {command}")
+    
     if command and command.args:
         param = command.args
         logging.info(f"Deep link from {user_id}: '{param}'")
         try:
             decoded_param = unquote(param)
-        except Exception:
+            logging.info(f"Decoded param: '{decoded_param}'")
+        except Exception as e:
+            logging.warning(f"Failed to decode param '{param}': {e}")
             decoded_param = param
 
         if decoded_param.startswith("full_"):
             domain = extract_domain(decoded_param[5:])
+            logging.info(f"Full report requested for domain: '{domain}'")
             if domain:
                 await send_topic_aware_message(message, f"📄 <b>Получаю полный отчет для {domain}...</b>")
                 await handle_domain_logic(message, domain, short_mode=False)
             else:
+                logging.warning(f"Invalid domain in full report link: '{decoded_param[5:]}'")
                 await send_topic_aware_message(message, f"❌ Некорректный домен в ссылке: {decoded_param[5:]}")
         else:
             domain = extract_domain(decoded_param)
+            logging.info(f"Short report requested for domain: '{domain}'")
             if domain:
                 await send_topic_aware_message(message, f"🔍 <b>Получаю результат для {domain}...</b>")
                 await handle_domain_logic(message, domain, short_mode=True)
             else:
-                await send_topic_aware_message(message, f"Неизвестный параметр deep-link: {decoded_param}")
+                logging.warning(f"Unknown deep-link parameter: '{decoded_param}'")
+                await send_topic_aware_message(message, f"❌ Неизвестный параметр deep-link: {decoded_param}")
         return
 
+    logging.info(f"Regular /start command from user {user_id}")
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов.\n\n"
         "Отправь мне домен для проверки, например: <code>google.com</code>\n"
