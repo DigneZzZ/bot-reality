@@ -129,8 +129,8 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
     # Сохраняем результат
     r = await get_redis()
     try:
-        # Сохраняем полный отчет в кэш
-        await r.set(f"result:{domain}", report, ex=86400)
+        # Сохраняем полный отчет в кэш на 7 дней (вместо 24 часов)
+        await r.set(f"result:{domain}", report, ex=604800)
 
         # Проверяем пригодность домена и добавляем в approved_domains (только если включена опция)
         if SAVE_APPROVED_DOMAINS and "✅ Пригоден для Reality" in report:
@@ -138,7 +138,7 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
 
         output = report  # Используем отчет напрямую из run_check
 
-        await r.lpush(f"history:{user_id}", f"{domain}: {'Краткий' if short_mode else 'Полный'} отчёт")
+        await r.lpush(f"history:{user_id}", f"{datetime.now().strftime('%H:%M')} - {domain}")
         await r.ltrim(f"history:{user_id}", 0, 9)
         await r.delete(f"pending:{domain}:{user_id}")
         return output

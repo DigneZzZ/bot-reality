@@ -64,6 +64,11 @@ logging.basicConfig(
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SAVE_APPROVED_DOMAINS = os.getenv("SAVE_APPROVED_DOMAINS", "false").lower() == "true"
+
+# Настройки автоочистки сообщений в группах
+AUTO_DELETE_GROUP_MESSAGES = os.getenv("AUTO_DELETE_GROUP_MESSAGES", "true").lower() == "true"
+AUTO_DELETE_TIMEOUT = int(os.getenv("AUTO_DELETE_TIMEOUT", "300"))  # 5 минут по умолчанию
+
 # Новые настройки для групп
 GROUP_MODE_ENABLED = os.getenv("GROUP_MODE_ENABLED", "true").lower() == "true"
 GROUP_COMMAND_PREFIX = os.getenv("GROUP_COMMAND_PREFIX", "!")  # Префикс для команд в группах
@@ -183,6 +188,23 @@ async def should_respond_in_group(message: types.Message) -> bool:
         
     return False
 
+async def schedule_message_deletion(chat_id: int, message_id: int, delay: int = AUTO_DELETE_TIMEOUT):
+    """Планирует удаление сообщения через заданное время"""
+    if not AUTO_DELETE_GROUP_MESSAGES:
+        return
+        
+    async def delete_after_delay():
+        try:
+            await asyncio.sleep(delay)
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logging.info(f"Auto-deleted message {message_id} in chat {chat_id}")
+        except Exception as e:
+            # Сообщение могло быть уже удалено или бот потерял права
+            logging.debug(f"Could not delete message {message_id} in chat {chat_id}: {e}")
+    
+    # Запускаем задачу в фоне
+    asyncio.create_task(delete_after_delay())
+
 def get_topic_thread_id(message: types.Message) -> int | None:
     """Получает ID темы (топика) из сообщения"""
     # Если это супергруппа с темами
@@ -197,7 +219,7 @@ async def send_topic_aware_message(message: types.Message, text: str, reply_mark
     try:
         if thread_id:
             # Отправляем в определенную тему
-            return await bot.send_message(
+            sent_message = await bot.send_message(
                 chat_id=message.chat.id,
                 text=text,
                 message_thread_id=thread_id,
@@ -206,11 +228,24 @@ async def send_topic_aware_message(message: types.Message, text: str, reply_mark
             )
         else:
             # Обычная отправка (или группа без тем)
-            return await message.answer(text, reply_markup=reply_markup)
+            sent_message = await message.answer(text, reply_markup=reply_markup)
+        
+        # Автоматически планируем удаление для групповых сообщений
+        if message.chat.type in ['group', 'supergroup'] and AUTO_DELETE_GROUP_MESSAGES:
+            await schedule_message_deletion(message.chat.id, sent_message.message_id)
+        
+        return sent_message
+        
     except Exception as e:
         # Fallback: пробуем отправить обычным способом
         logging.warning(f"Failed to send topic-aware message: {e}, falling back to regular message")
-        return await message.answer(text, reply_markup=reply_markup)
+        sent_message = await message.answer(text, reply_markup=reply_markup)
+        
+        # Автоматически планируем удаление для групповых сообщений
+        if message.chat.type in ['group', 'supergroup'] and AUTO_DELETE_GROUP_MESSAGES:
+            await schedule_message_deletion(message.chat.id, sent_message.message_id)
+        
+        return sent_message
 
 async def log_analytics(action: str, user_id: int, **kwargs):
     """Логирует событие в аналитику"""
@@ -496,27 +531,35 @@ async def handle_bulk_domains_in_group(message: types.Message, domains: list, us
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         
-        # Формируем сообщение
-        response_text = (
-            f"🔍 <b>Обработка {len(domains)} доменов</b>\n\n"
-            f"📊 <b>Статус:</b>\n"
-            f"• Из кэша: {len(cached_domains)}\n"
-            f"• В очереди: {len(pending_domains)}\n\n"
-            f"💡 <b>Получить результаты:</b>\n"
-            f"Нажмите на кнопки ниже для перехода в ЛС с ботом"
-        )
+        # Если больше одного домена - отправляем только уведомление с кнопками для перехода в ЛС
+        if len(domains) > 1:
+            # Формируем минимальное сообщение с кнопками
+            response_text = (
+                f"🔍 <b>Массовая проверка {len(domains)} доменов</b>\n\n"
+                f"💡 Результаты будут доступны в ЛС с ботом:"
+            )
+        else:
+            # Для одного домена показываем подробную информацию
+            response_text = (
+                f"🔍 <b>Обработка {len(domains)} доменов</b>\n\n"
+                f"📊 <b>Статус:</b>\n"
+                f"• Из кэша: {len(cached_domains)}\n"
+                f"• В очереди: {len(pending_domains)}\n\n"
+                f"💡 <b>Получить результаты:</b>\n"
+                f"Нажмите на кнопки ниже для перехода в ЛС с ботом"
+            )
+            
+            if cached_domains:
+                response_text += f"\n\n✅ <b>Готовые:</b> {', '.join(cached_domains[:5])}"
+                if len(cached_domains) > 5:
+                    response_text += f" и ещё {len(cached_domains) - 5}..."
+            
+            if pending_domains:
+                response_text += f"\n\n⏳ <b>В обработке:</b> {', '.join(pending_domains[:5])}"
+                if len(pending_domains) > 5:
+                    response_text += f" и ещё {len(pending_domains) - 5}..."
         
-        if cached_domains:
-            response_text += f"\n\n✅ <b>Готовые:</b> {', '.join(cached_domains[:5])}"
-            if len(cached_domains) > 5:
-                response_text += f" и ещё {len(cached_domains) - 5}..."
-        
-        if pending_domains:
-            response_text += f"\n\n⏳ <b>В обработке:</b> {', '.join(pending_domains[:5])}"
-            if len(pending_domains) > 5:
-                response_text += f" и ещё {len(pending_domains) - 5}..."
-        
-        await send_topic_aware_message(message, response_text, reply_markup=keyboard)
+        sent_message = await send_topic_aware_message(message, response_text, reply_markup=keyboard)
         
     except Exception as e:
         logging.error(f"Failed to handle bulk domains in group: {e}")
@@ -532,20 +575,30 @@ async def handle_deep_link_single_result(message: types.Message, domain: str):
     try:
         cached = await r.get(f"result:{domain}")
         if cached:
-            await message.answer(f"📄 Результат для {domain}:\n\n{cached}")
+            await message.answer(f"📄 <b>Результат для {domain}:</b>\n\n{cached}")
             await log_analytics("domain_check", user_id,
                               domain=domain, check_type="single_result",
                               result_status="cached", execution_time=0)
         else:
             # Проверяем, есть ли домен в очереди
-            await message.answer(
-                f"⏳ Результат для {domain} пока не готов.\n\n"
-                f"💡 Возможные причины:\n"
-                f"• Домен ещё обрабатывается\n"
-                f"• Результат устарел и был удален из кэша\n"
-                f"• Произошла ошибка при обработке\n\n"
-                f"🔄 Попробуйте запросить проверку заново: /check {domain}"
-            )
+            is_pending = await r.get(f"pending:{domain}:{user_id}")
+            
+            if is_pending:
+                await message.answer(
+                    f"⏳ <b>Домен {domain} обрабатывается</b>\n\n"
+                    f"🔄 Результат будет готов через несколько секунд.\n"
+                    f"💡 Попробуйте нажать кнопку снова через 10-30 секунд."
+                )
+            else:
+                await message.answer(
+                    f"❌ <b>Результат для {domain} недоступен</b>\n\n"
+                    f"💡 <b>Возможные причины:</b>\n"
+                    f"• Домен ещё не проверялся\n"
+                    f"• Результат устарел и был удален из кэша (24 часа)\n"
+                    f"• Произошла ошибка при обработке\n\n"
+                    f"🔄 <b>Решение:</b> Запросите проверку заново:\n"
+                    f"<code>/check {domain}</code>"
+                )
     except Exception as e:
         logging.error(f"Failed to get single result for {domain} by user {user_id}: {str(e)}")
         await message.answer(f"❌ Ошибка при получении результата для {domain}: {str(e)}")
@@ -567,28 +620,52 @@ async def handle_deep_link_all_results(message: types.Message, user_id: int):
         found_results = 0
         
         for entry in history:
+            # Пробуем разные форматы записи в истории
+            domain = None
             if " - " in entry:
                 domain = entry.split(" - ")[1].strip()
+            elif ": " in entry:
+                domain = entry.split(": ")[0].strip()
+            
+            if domain:
                 cached = await r.get(f"result:{domain}")
                 if cached:
                     found_results += 1
                     # Ограничиваем вывод короткой версией
-                    lines = cached.split("\n")[:8]  # Первые 8 строк
+                    lines = cached.split("\n")[:10]  # Увеличиваем до 10 строк
                     short_result = "\n".join(lines)
-                    if len(cached.split("\n")) > 8:
-                        short_result += "\n..."
+                    if len(cached.split("\n")) > 10:
+                        short_result += "\n<i>... (показаны первые 10 строк)</i>"
                     
                     results_text += f"🔍 <b>{domain}:</b>\n{short_result}\n\n"
                     
                     # Ограничиваем количество результатов в одном сообщении
-                    if found_results >= 5:
+                    if found_results >= 3:  # Уменьшаем до 3 для читаемости
                         break
         
         if found_results == 0:
-            await message.answer("📜 Результаты ваших недавних проверок больше не доступны в кэше.")
+            # Проверяем доступные результаты в кэше
+            all_cached_keys = await r.keys("result:*")
+            available_domains = []
+            for key in all_cached_keys:
+                domain_name = key.decode('utf-8').replace('result:', '') if hasattr(key, 'decode') else str(key).replace('result:', '')
+                available_domains.append(domain_name)
+            
+            if available_domains:
+                domains_text = ", ".join(available_domains[:10])
+                if len(available_domains) > 10:
+                    domains_text += f" и ещё {len(available_domains) - 10}..."
+                
+                await message.answer(
+                    f"📜 Ваши недавние результаты больше не в истории, но есть кэшированные результаты:\n\n"
+                    f"🔍 <b>Доступные домены:</b> {domains_text}\n\n"
+                    f"💡 Используйте команду <code>/check домен</code> для получения результата"
+                )
+            else:
+                await message.answer("📜 Результаты ваших недавних проверок больше не доступны в кэше.")
         else:
             if len(results_text) > 4000:  # Ограничение Telegram
-                results_text = results_text[:3900] + "\n\n... (сообщение обрезано)"
+                results_text = results_text[:3900] + "\n\n<i>... (сообщение обрезано)</i>"
             
             await message.answer(results_text)
             
