@@ -1,7 +1,7 @@
 from typing import Optional
 import asyncio
 from aiogram import Bot, Router, types
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ChatType
 import os
@@ -449,96 +449,72 @@ async def check_daily_limit(user_id: int, is_group: bool = False, chat_id: Optio
     finally:
         await r.aclose()
 
+@router.message(CommandStart(deep_link=True))
+async def cmd_start_deep_link(message: types.Message, command: CommandObject):
+    if not message.from_user:
+        logging.warning("Received start command without a user context.")
+        return
+        
+    user_id = message.from_user.id
+    param = command.args
+
+    if not param:
+        logging.warning(f"Deep link command called by {user_id} but no args found. Showing welcome.")
+        # Если аргументов нет, просто показываем приветственное сообщение
+        await cmd_start_no_deep_link(message)
+        return
+
+    logging.warning(f"Deep link parameter detected: '{param}' by user {user_id}")
+
+    try:
+        decoded_param = unquote(param)
+        logging.warning(f"Decoded parameter: '{decoded_param}' by user {user_id}")
+    except Exception as e:
+        decoded_param = param
+        logging.warning(f"Parameter decode failed: {e}, using original: '{param}' by user {user_id}")
+
+    if decoded_param.startswith("full_"):
+        domain_part = decoded_param[5:]
+        domain = extract_domain(domain_part)
+        if domain:
+            logging.warning(f"Deep link full report activated for domain {domain} by user {user_id}")
+            try:
+                await message.answer(f"📄 <b>Получаю полный отчет для {domain}...</b>")
+                await handle_domain_logic(message, domain, short_mode=False)
+            except Exception as e:
+                logging.error(f"Error in full report processing for {domain} by user {user_id}: {e}")
+                await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
+        else:
+            await message.answer(f"❌ Некорректный домен в полном отчете: {domain_part}")
+    else:
+        domain = extract_domain(decoded_param)
+        if domain:
+            logging.warning(f"Deep link activated for domain {domain} by user {user_id}")
+            try:
+                await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
+                await handle_domain_logic(message, domain, short_mode=True)
+            except Exception as e:
+                logging.error(f"Error in short report processing for {domain} by user {user_id}: {e}")
+                await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
+        else:
+            # Если параметр не является ни доменом, ни командой full_, показываем приветствие
+            logging.warning(f"Deep link param '{decoded_param}' is not a valid domain for user {user_id}. Showing welcome.")
+            await cmd_start_no_deep_link(message)
+
 @router.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start_no_deep_link(message: types.Message):
+    if not message.from_user:
+        logging.warning("Received start command without a user context.")
+        return
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
-    
-    # Логируем вызов команды /start
-    logging.warning(f"Command /start called by user {user_id}, message text: '{message.text}'")
-    
-    # Проверяем простые параметры после /start
-    if message.text and len(message.text.split()) > 1:
-        param = message.text.split()[1]
-        logging.warning(f"Deep link parameter detected: '{param}' by user {user_id}")
-        
-        # Декодируем URL-кодированный параметр
-        try:
-            decoded_param = unquote(param)
-            logging.warning(f"Decoded parameter: '{decoded_param}' by user {user_id}")
-        except Exception as e:
-            decoded_param = param  # Fallback если декодирование не удалось
-            logging.warning(f"Parameter decode failed: {e}, using original: '{param}' by user {user_id}")
-        
-        # Проверяем специальные deep link команды
-        if decoded_param.startswith("full_"):
-            # Это запрос полного отчета: /start full_domain.com
-            domain_part = decoded_param[5:]  # Убираем "full_"
-            domain = extract_domain(domain_part)
-            if domain:
-                logging.warning(f"Deep link full report activated for domain {domain} by user {user_id}")
-                try:
-                    await message.answer(f"📄 <b>Получаю полный отчет для {domain}...</b>")
-                    logging.warning(f"Sent full report message for {domain} to user {user_id}")
-                    # Вызываем handle_domain_logic с full режимом
-                    await handle_domain_logic(message, domain, short_mode=False)
-                    logging.warning(f"Completed handle_domain_logic (full) for {domain} by user {user_id}")
-                except Exception as e:
-                    logging.error(f"Error in full report processing for {domain} by user {user_id}: {e}")
-                    await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
-                return
-            else:
-                logging.warning(f"Failed to extract domain from full deep link param: {domain_part}")
-                await message.answer(f"❌ Некорректный домен в полном отчете: {domain_part}")
-                return
-        
-        # Простая проверка - если это выглядит как домен, проверяем его (краткий отчет)
-        elif "." in decoded_param and len(decoded_param) > 3:
-            # Это похоже на домен - просто запускаем проверку в ЛС
-            domain = extract_domain(decoded_param)
-            if domain:
-                logging.warning(f"Deep link activated for domain {domain} by user {user_id}")
-                try:
-                    await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
-                    logging.warning(f"Sent short report message for {domain} to user {user_id}")
-                    # Вызываем handle_domain_logic с корректными параметрами
-                    await handle_domain_logic(message, domain, short_mode=True)
-                    logging.warning(f"Completed handle_domain_logic (short) for {domain} by user {user_id}")
-                except Exception as e:
-                    logging.error(f"Error in short report processing for {domain} by user {user_id}: {e}")
-                    await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
-                return
-            else:
-                logging.warning(f"Failed to extract domain from deep link param: {decoded_param}")
-                await message.answer(f"❌ Некорректный домен: {decoded_param}")
-                return
-        
-        # Проверяем, может быть это просто домен без точки или короткий (например, через редирект)
-        else:
-            # Пробуем извлечь домен даже из коротких параметров
-            domain = extract_domain(decoded_param)
-            if domain:
-                logging.warning(f"Deep link activated for short domain {domain} by user {user_id}")
-                try:
-                    await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
-                    logging.warning(f"Sent fallback message for {domain} to user {user_id}")
-                    await handle_domain_logic(message, domain, short_mode=True)
-                    logging.warning(f"Completed handle_domain_logic (fallback) for {domain} by user {user_id}")
-                except Exception as e:
-                    logging.error(f"Error in fallback processing for {domain} by user {user_id}: {e}")
-                    await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
-                return
-            else:
-                logging.warning(f"No domain found in parameter '{decoded_param}' by user {user_id}")
-    else:
-        logging.warning(f"No deep link parameter found, showing welcome message to user {user_id}")
+    logging.warning(f"Command /start without deep link called by user {user_id}")
     
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
         "/mode — Переключить режим вывода (краткий/полный)\n"
         "/history — Показать последние 10 проверок\n"
-
     )
     if is_admin:
         admin_commands = [
