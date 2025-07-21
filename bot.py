@@ -460,12 +460,15 @@ async def cmd_start(message: types.Message):
     # Проверяем простые параметры после /start
     if message.text and len(message.text.split()) > 1:
         param = message.text.split()[1]
+        logging.warning(f"Deep link parameter detected: '{param}' by user {user_id}")
         
         # Декодируем URL-кодированный параметр
         try:
             decoded_param = unquote(param)
-        except:
+            logging.warning(f"Decoded parameter: '{decoded_param}' by user {user_id}")
+        except Exception as e:
             decoded_param = param  # Fallback если декодирование не удалось
+            logging.warning(f"Parameter decode failed: {e}, using original: '{param}' by user {user_id}")
         
         # Проверяем специальные deep link команды
         if decoded_param.startswith("full_"):
@@ -474,9 +477,15 @@ async def cmd_start(message: types.Message):
             domain = extract_domain(domain_part)
             if domain:
                 logging.warning(f"Deep link full report activated for domain {domain} by user {user_id}")
-                await message.answer(f"📄 <b>Получаю полный отчет для {domain}...</b>")
-                # Вызываем handle_domain_logic с full режимом
-                await handle_domain_logic(message, domain, short_mode=False)
+                try:
+                    await message.answer(f"📄 <b>Получаю полный отчет для {domain}...</b>")
+                    logging.warning(f"Sent full report message for {domain} to user {user_id}")
+                    # Вызываем handle_domain_logic с full режимом
+                    await handle_domain_logic(message, domain, short_mode=False)
+                    logging.warning(f"Completed handle_domain_logic (full) for {domain} by user {user_id}")
+                except Exception as e:
+                    logging.error(f"Error in full report processing for {domain} by user {user_id}: {e}")
+                    await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
                 return
             else:
                 logging.warning(f"Failed to extract domain from full deep link param: {domain_part}")
@@ -489,9 +498,15 @@ async def cmd_start(message: types.Message):
             domain = extract_domain(decoded_param)
             if domain:
                 logging.warning(f"Deep link activated for domain {domain} by user {user_id}")
-                await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
-                # Вызываем handle_domain_logic с корректными параметрами
-                await handle_domain_logic(message, domain, short_mode=True)
+                try:
+                    await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
+                    logging.warning(f"Sent short report message for {domain} to user {user_id}")
+                    # Вызываем handle_domain_logic с корректными параметрами
+                    await handle_domain_logic(message, domain, short_mode=True)
+                    logging.warning(f"Completed handle_domain_logic (short) for {domain} by user {user_id}")
+                except Exception as e:
+                    logging.error(f"Error in short report processing for {domain} by user {user_id}: {e}")
+                    await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
                 return
             else:
                 logging.warning(f"Failed to extract domain from deep link param: {decoded_param}")
@@ -504,9 +519,19 @@ async def cmd_start(message: types.Message):
             domain = extract_domain(decoded_param)
             if domain:
                 logging.warning(f"Deep link activated for short domain {domain} by user {user_id}")
-                await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
-                await handle_domain_logic(message, domain, short_mode=True)
+                try:
+                    await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
+                    logging.warning(f"Sent fallback message for {domain} to user {user_id}")
+                    await handle_domain_logic(message, domain, short_mode=True)
+                    logging.warning(f"Completed handle_domain_logic (fallback) for {domain} by user {user_id}")
+                except Exception as e:
+                    logging.error(f"Error in fallback processing for {domain} by user {user_id}: {e}")
+                    await message.answer(f"❌ Ошибка при обработке запроса: {str(e)}")
                 return
+            else:
+                logging.warning(f"No domain found in parameter '{decoded_param}' by user {user_id}")
+    else:
+        logging.warning(f"No deep link parameter found, showing welcome message to user {user_id}")
     
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для Reality.\n\n"
@@ -950,8 +975,8 @@ async def admin_help_command(message: types.Message):
         "/clearcache — Очистить кэш результатов",
         "/analytics — Показать аналитику бота (NEW!)",
         "/groups — Управление авторизованными группами (NEW!)",
-        "/groups_add <ID> — Добавить группу в авторизованные",
-        "/groups_remove <ID> — Удалить группу из авторизованных", 
+        "/groups_add &lt;ID&gt; — Добавить группу в авторизованные",
+        "/groups_remove &lt;ID&gt; — Удалить группу из авторизованных", 
         "/groups_current — Показать ID текущей группы",
         "/adminhelp — Показать этот список команд"
     ])
@@ -1033,8 +1058,8 @@ async def groups_command(message: types.Message):
     status += f"🔧 <b>Префикс команд:</b> <code>{GROUP_COMMAND_PREFIX}</code>\n\n"
     
     status += "📋 <b>Команды управления:</b>\n"
-    status += "/groups_add <ID> — Добавить группу\n"
-    status += "/groups_remove <ID> — Удалить группу\n"
+    status += "/groups_add &lt;ID&gt; — Добавить группу\n"
+    status += "/groups_remove &lt;ID&gt; — Удалить группу\n"
     status += "/groups_current — Показать ID текущей группы\n"
     
     await message.reply(status)
@@ -1463,8 +1488,11 @@ async def process_callback(callback_query: types.CallbackQuery):
 
 async def handle_domain_logic(message: types.Message, input_text: str, inconclusive_domain_limit=5, short_mode: bool = True):
     user_id = message.from_user.id
+    logging.warning(f"handle_domain_logic called: user_id={user_id}, input_text='{input_text}', short_mode={short_mode}")
+    
     penalty, active = get_penalty(user_id)
     if active:
+        logging.warning(f"User {user_id} is under penalty: {penalty//60} minutes")
         await message.reply(f"🚫 Вы ограничены на {penalty//60} минут.")
         return
 
