@@ -3,17 +3,12 @@ services:
     container_name: domain-bot
     image: ghcr.io/dignezzz/bot-reality:latest
     command: python bot.py
+    env_file:
+      - .env
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
+      # Переопределяем только Docker-специфичные настройки
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - ADMIN_ID=${ADMIN_ID}
-      - SAVE_APPROVED_DOMAINS=${SAVE_APPROVED_DOMAINS:-false}
-      - GROUP_MODE_ENABLED=${GROUP_MODE_ENABLED:-true}
-      - GROUP_COMMAND_PREFIX=${GROUP_COMMAND_PREFIX:-!}
-      - AUTHORIZED_GROUPS=${AUTHORIZED_GROUPS:-}
-      - AUTO_LEAVE_UNAUTHORIZED=${AUTO_LEAVE_UNAUTHORIZED:-false}
     depends_on:
       - redis
     volumes:
@@ -32,20 +27,16 @@ services:
         max-size: "5m"  # Уменьшено с 10m
         max-file: "2"   # Уменьшено с 3
         compress: "true"
+        
   worker:
     image: ghcr.io/dignezzz/bot-reality:latest
     command: python worker.py
+    env_file:
+      - .env
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
+      # Переопределяем только Docker-специфичные настройки
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - ADMIN_ID=${ADMIN_ID}
-      - SAVE_APPROVED_DOMAINS=${SAVE_APPROVED_DOMAINS:-false}
-      - GROUP_MODE_ENABLED=${GROUP_MODE_ENABLED:-true}
-      - GROUP_COMMAND_PREFIX=${GROUP_COMMAND_PREFIX:-!}
-      - AUTHORIZED_GROUPS=${AUTHORIZED_GROUPS:-}
-      - AUTO_LEAVE_UNAUTHORIZED=${AUTO_LEAVE_UNAUTHORIZED:-false}
     depends_on:
       - redis
     volumes:
@@ -69,6 +60,8 @@ services:
   redis:
     container_name: domain-redis
     image: redis:7
+    env_file:
+      - .env
     command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 100mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
