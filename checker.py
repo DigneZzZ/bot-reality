@@ -13,7 +13,7 @@ from logging.handlers import RotatingFileHandler
 import os
 
 # Настройка логирования с ротацией
-log_dir = "/app"
+log_dir = os.getenv("LOG_DIR", "/app")
 log_file = os.path.join(log_dir, "checker.log")
 os.makedirs(log_dir, exist_ok=True)
 
