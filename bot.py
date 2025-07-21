@@ -1520,6 +1520,9 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
             else:
                 await send_topic_aware_message(message, "❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
             return
+
+        # Обработка групповых чатов - отправляем короткое сообщение с кнопками для получения результатов в ЛС
+        if is_group:
             # Просто ставим в очередь без всяких сообщений
             for domain in valid_domains:
                 chat_id = message.chat.id
@@ -1756,7 +1759,7 @@ async def main():
     dp.include_router(router)
     
     try:
-        logging.info("🚀 Starting Domain Reality Bot...")
+        logging.warning("🚀 Starting Domain Reality Bot...")
         await dp.start_polling(bot)
     except Exception as e:
         logging.error(f"Error starting bot: {e}")
