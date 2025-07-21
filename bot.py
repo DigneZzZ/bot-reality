@@ -406,18 +406,9 @@ async def cmd_start(message: types.Message):
             await handle_deep_link_full_report(message, domain)
             return
         elif param.startswith("result_"):
-            # result_domain_userid - запрос результата конкретного домена
-            parts = param[7:].split("_", 1)  # Убираем "result_" префикс
-            if len(parts) >= 2:
-                domain = parts[0]
-                try:
-                    target_user_id = int(parts[1])
-                    if user_id == target_user_id:
-                        await handle_deep_link_single_result(message, domain)
-                    else:
-                        await message.answer("❌ Этот результат предназначен не для вас.")
-                except ValueError:
-                    await message.answer("❌ Неверный формат ссылки.")
+            # result_domain - запрос результата конкретного домена (доступно всем)
+            domain = param[7:]  # Убираем "result_" префикс
+            await handle_deep_link_single_result(message, domain)
             return
         elif param.startswith("results_all_"):
             # results_all_userid - запрос всех результатов пользователя
@@ -513,21 +504,14 @@ async def handle_bulk_domains_in_group(message: types.Message, domains: list, us
             row = []
             for domain in batch:
                 # Создаем deep link для получения результата в ЛС
-                deep_link = f"https://t.me/{bot_username}?start=result_{domain}_{user_id}"
+                deep_link = f"https://t.me/{bot_username}?start=result_{domain}"
                 row.append(InlineKeyboardButton(
                     text=f"📄 {domain}", 
                     url=deep_link
                 ))
             buttons.append(row)
         
-        # Добавляем кнопку для получения всех результатов сразу
-        if len(domains) > 1:
-            all_domains_param = "_".join(domains[:5])  # Ограничиваем длину
-            deep_link_all = f"https://t.me/{bot_username}?start=results_all_{user_id}"
-            buttons.append([InlineKeyboardButton(
-                text="📄 Все результаты в ЛС", 
-                url=deep_link_all
-            )])
+        # Убираем кнопку "Все результаты" - она персональная
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         
@@ -580,10 +564,10 @@ async def handle_deep_link_single_result(message: types.Message, domain: str):
                               domain=domain, check_type="single_result",
                               result_status="cached", execution_time=0)
         else:
-            # Проверяем, есть ли домен в очереди
-            is_pending = await r.get(f"pending:{domain}:{user_id}")
+            # Проверяем, есть ли домен в очереди (проверяем любого пользователя)
+            pending_keys = await r.keys(f"pending:{domain}:*")
             
-            if is_pending:
+            if pending_keys:
                 await message.answer(
                     f"⏳ <b>Домен {domain} обрабатывается</b>\n\n"
                     f"🔄 Результат будет готов через несколько секунд.\n"
@@ -1419,9 +1403,54 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                 await send_topic_aware_message(message, "❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
             return
 
-        # Для массовых запросов (более 1 домена) в группах - один ответ с кнопками
+        # Для массовых запросов (более 1 домена) в группах - НЕ отправляем сообщения в группу
         if len(valid_domains) > 1 and is_group_chat(message):
-            await handle_bulk_domains_in_group(message, valid_domains, user_id, short_mode)
+            # Просто ставим в очередь без ответа в группе
+            for domain in valid_domains:
+                chat_id = message.chat.id
+                message_id = message.message_id
+                thread_id = get_topic_thread_id(message)
+                
+                await enqueue(domain, user_id, short_mode=short_mode,
+                             chat_id=chat_id, message_id=message_id, thread_id=thread_id)
+            
+            # Отправляем уведомление только в ЛС пользователю
+            try:
+                bot_info = await bot.get_me()
+                bot_username = bot_info.username
+                
+                # Создаем кнопки для получения результатов
+                buttons = []
+                for i in range(0, len(valid_domains), 3):
+                    batch = valid_domains[i:i+3]
+                    row = []
+                    for domain in batch:
+                        deep_link = f"https://t.me/{bot_username}?start=result_{domain}"
+                        row.append(InlineKeyboardButton(text=f"📄 {domain}", url=deep_link))
+                    buttons.append(row)
+                
+                # Убираем кнопку "Все результаты" так как она персональная
+                
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+                
+                # Отправляем уведомление в ЛС
+                private_message = (
+                    f"🔍 <b>Массовая проверка {len(valid_domains)} доменов</b>\n\n"
+                    f"📊 Ваш запрос из группы обрабатывается.\n"
+                    f"Результаты будут готовы через несколько секунд.\n\n"
+                    f"📄 <b>Получить результаты:</b>"
+                )
+                
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=private_message,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+                
+            except Exception as e:
+                logging.error(f"Failed to send private notification for bulk request: {e}")
+            
             return
         
         # Если доменов много и доступен BatchProcessor, используем его (только в ЛС)
