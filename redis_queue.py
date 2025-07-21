@@ -2,6 +2,7 @@ import os
 import redis.asyncio as redis
 import logging
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 # Настройка логирования
 log_file = "/app/redis_queue.log"
@@ -37,14 +38,27 @@ async def is_domain_in_queue(domain: str, user_id: int) -> bool:
     finally:
         await r.aclose()
 
-async def enqueue(domain: str, user_id: int, short_mode: bool):
+async def enqueue(domain: str, user_id: int, short_mode: bool, chat_id: Optional[int] = None, message_id: Optional[int] = None, thread_id: Optional[int] = None):
     r = await get_redis()
     try:
         pending_key = f"pending:{domain}:{user_id}"
         if await r.exists(pending_key):
             logging.info(f"Domain {domain} for user {user_id} already in queue, skipping")
             return False
-        task = f"{domain}:{user_id}:{short_mode}"
+        
+        # Создаём расширенный task с контекстом чата
+        task_data = {
+            'domain': domain,
+            'user_id': user_id,
+            'short_mode': short_mode,
+            'chat_id': chat_id or user_id,  # Если chat_id не указан, используем user_id (ЛС)
+            'message_id': message_id,
+            'thread_id': thread_id
+        }
+        
+        # Сериализуем в JSON для хранения в Redis
+        import json
+        task = json.dumps(task_data)
         await r.lpush("queue:domains", task)
         await r.set(pending_key, "1", ex=300)  # Флаг на 5 минут
         logging.info(f"Enqueued task: {task}")

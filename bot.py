@@ -256,6 +256,13 @@ def get_full_report_button(domain: str):
     ])
     return keyboard
 
+def get_group_full_report_button(domain: str, user_id: int):
+    """Создаёт кнопку для получения полного отчёта в ЛС из группового чата"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", callback_data=f"full_pm:{domain}:{user_id}")]
+    ])
+    return keyboard
+
 async def get_redis():
     try:
         redis_client = redis.Redis(
@@ -969,9 +976,11 @@ async def process_callback(callback_query: types.CallbackQuery):
                 elif not await check_daily_limit(user_id):
                     await callback_query.message.answer("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
                 else:
-                    enqueued = await enqueue(domain, user_id, short_mode=False)
+                    # Полный отчёт всегда отправляем в ЛС, даже если запрос из группы
+                    enqueued = await enqueue(domain, user_id, short_mode=False, 
+                                           chat_id=user_id)  # Принудительно в ЛС
                     if enqueued:
-                        await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт.")
+                        await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт в ЛС.")
                     else:
                         await callback_query.message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
         except Exception as e:
@@ -979,6 +988,47 @@ async def process_callback(callback_query: types.CallbackQuery):
             await callback_query.message.answer(f"❌ Ошибка: {str(e)}")
         finally:
             await r.aclose()
+    elif callback_query.data.startswith("full_pm:"):
+        # Новый callback для получения полного отчёта в ЛС из группы
+        parts = callback_query.data.split(":", 2)
+        if len(parts) >= 3:
+            domain = parts[1]
+            target_user_id = int(parts[2])
+            
+            # Проверяем, что пользователь имеет право на этот отчёт
+            if user_id != target_user_id:
+                await callback_query.answer("❌ Этот отчёт предназначен не для вас", show_alert=True)
+                return
+            
+            # Проверяем лимиты
+            if not await check_rate_limit(user_id):
+                await callback_query.answer("🚫 Слишком много запросов. Не более 10 в минуту.", show_alert=True)
+                return
+            if not await check_daily_limit(user_id):
+                await callback_query.answer("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.", show_alert=True)
+                return
+            
+            r = await get_redis()
+            try:
+                cached = await r.get(f"result:{domain}")
+                if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):
+                    # Отправляем полный отчёт в ЛС
+                    await bot.send_message(user_id, f"📄 Полный отчёт для {domain}:\n\n{cached}")
+                    await callback_query.answer("✅ Полный отчёт отправлен в ЛС")
+                else:
+                    # Ставим в очередь на полный отчёт в ЛС
+                    enqueued = await enqueue(domain, user_id, short_mode=False, chat_id=user_id)
+                    if enqueued:
+                        await callback_query.answer("✅ Запрос на полный отчёт принят. Результат придёт в ЛС")
+                    else:
+                        await callback_query.answer("⚠️ Домен уже в очереди на проверку")
+            except Exception as e:
+                logging.error(f"Failed to process full_pm for {domain} by user {user_id}: {str(e)}")
+                await callback_query.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+            finally:
+                await r.aclose()
+        else:
+            await callback_query.answer("❌ Неверный формат запроса", show_alert=True)
     else:
         await callback_query.message.reply("⛔ Доступ к этой команде ограничен.")
         logging.warning(f"User {user_id} attempted unauthorized callback: {callback_query.data}")
@@ -1049,8 +1099,13 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                                               result_status="cached", execution_time=time() - start_time)
                             return f"⚡ Результат из кэша для {domain}:\n\n{cached}"
                         
-                        # Ставим в очередь
-                        enqueued = await enqueue(domain, user_id, short_mode=short_mode)
+                        # Ставим в очередь с контекстом
+                        chat_id = message.chat.id
+                        message_id = message.message_id
+                        thread_id = get_topic_thread_id(message)
+                        
+                        enqueued = await enqueue(domain, user_id, short_mode=short_mode,
+                                               chat_id=chat_id, message_id=message_id, thread_id=thread_id)
                         if enqueued:
                             await log_analytics("domain_check", user_id,
                                               domain=domain, check_type="short" if short_mode else "full",
@@ -1108,9 +1163,16 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                         else:
                             include_next = False
                     filtered = "\n".join(filtered_lines)
+                    
+                    # Выбираем правильную кнопку в зависимости от типа чата
+                    if is_group_chat(message):
+                        keyboard = get_group_full_report_button(domain, user_id)
+                    else:
+                        keyboard = get_full_report_button(domain)
+                    
                     await send_topic_aware_message(message,
                         f"⚡ Результат из кэша для {domain}:\n\n{filtered}",
-                        reply_markup=get_full_report_button(domain)
+                        reply_markup=keyboard
                     )
                     await log_analytics("domain_check", user_id,
                                       domain=domain, check_type="short" if short_mode else "full",
@@ -1125,7 +1187,13 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                 await r.lpush(f"history:{user_id}", f"{datetime.now().strftime('%Y-%m-%d %H:%M')} - {domain}")
                 await r.ltrim(f"history:{user_id}", 0, 9)
             else:
-                enqueued = await enqueue(domain, user_id, short_mode=short_mode)
+                # Передаём контекст чата при постановке в очередь
+                chat_id = message.chat.id
+                message_id = message.message_id
+                thread_id = get_topic_thread_id(message)
+                
+                enqueued = await enqueue(domain, user_id, short_mode=short_mode,
+                                       chat_id=chat_id, message_id=message_id, thread_id=thread_id)
                 if enqueued:
                     await send_topic_aware_message(message, f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт.")
                     await log_analytics("domain_check", user_id,

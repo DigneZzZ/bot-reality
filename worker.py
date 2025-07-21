@@ -2,12 +2,15 @@ import asyncio
 import redis.asyncio as redis
 import logging
 import os
+import json
 from logging.handlers import RotatingFileHandler
 from redis_queue import get_redis
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot import get_full_report_button
 from checker import run_check  # Импорт функции из checker.py
 from datetime import datetime
+from typing import Optional
 
 # Импортируем новые модули (если доступны)
 try:
@@ -159,6 +162,62 @@ async def cache_cleanup_task(r: redis.Redis):
         await clear_cache(r)
         await asyncio.sleep(86400)
 
+def get_group_full_report_button(domain: str, user_id: int):
+    """Создаёт кнопку для получения полного отчёта в ЛС"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", callback_data=f"full_pm:{domain}:{user_id}")]
+    ])
+    return keyboard
+
+async def send_group_reply(chat_id: int, message_id: Optional[int], thread_id: Optional[int], text: str, reply_markup=None):
+    """Отправляет ответ в группу с поддержкой тем и reply"""
+    try:
+        if thread_id:
+            # Отправляем в определенную тему
+            if message_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    message_thread_id=thread_id,
+                    reply_to_message_id=message_id,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    message_thread_id=thread_id,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
+        else:
+            # Обычная отправка в группу
+            if message_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_to_message_id=message_id,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
+    except Exception as e:
+        logging.error(f"Failed to send group reply to {chat_id}: {e}")
+        # Fallback: отправляем без reply/thread
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+
 async def worker():
     r = await get_redis()
     try:
@@ -170,14 +229,49 @@ async def worker():
                 if result is None:
                     continue
                 _, task = result
-                domain, user_id, short_mode = task.split(":")
-                user_id = int(user_id)
-                short_mode = short_mode == "True"
-                result = await check_domain(domain, user_id, short_mode)
+                
+                # Попробуем парсить как JSON (новый формат)
                 try:
-                    await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain) if short_mode else None)
+                    task_data = json.loads(task)
+                    domain = task_data['domain']
+                    user_id = int(task_data['user_id'])
+                    short_mode = task_data['short_mode']
+                    chat_id = task_data.get('chat_id', user_id)
+                    message_id = task_data.get('message_id')
+                    thread_id = task_data.get('thread_id')
+                except (json.JSONDecodeError, KeyError):
+                    # Fallback к старому формату
+                    domain, user_id, short_mode = task.split(":")
+                    user_id = int(user_id)
+                    short_mode = short_mode == "True"
+                    chat_id = user_id
+                    message_id = None
+                    thread_id = None
+                
+                result = await check_domain(domain, user_id, short_mode)
+                
+                try:
+                    # Определяем, это групповой чат или ЛС
+                    is_group = chat_id != user_id
+                    
+                    if is_group:
+                        # В группе отвечаем кратким отчётом с кнопкой "Полный в ЛС"
+                        if short_mode:
+                            # Краткий отчёт + кнопка для полного в ЛС
+                            keyboard = get_group_full_report_button(domain, user_id)
+                            await send_group_reply(chat_id, message_id, thread_id, result, keyboard)
+                        else:
+                            # Полный отчёт в группе не отправляем, отправляем в ЛС
+                            await bot.send_message(user_id, f"📄 Полный отчёт для {domain}:\n\n{result}")
+                            # В группе уведомляем о том, что отчёт отправлен в ЛС
+                            await send_group_reply(chat_id, message_id, thread_id, 
+                                                 f"✅ Полный отчёт для <b>{domain}</b> отправлен вам в личные сообщения.")
+                    else:
+                        # В ЛС отправляем как обычно
+                        await bot.send_message(user_id, result, 
+                                             reply_markup=get_full_report_button(domain) if short_mode else None)
                 except Exception as e:
-                    logging.error(f"Failed to send message to user {user_id} for {domain}: {str(e)}")
+                    logging.error(f"Failed to send message to chat {chat_id} for {domain}: {str(e)}")
             except Exception as e:
                 logging.error(f"Worker error: {str(e)}")
                 await asyncio.sleep(1)
