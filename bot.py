@@ -9,7 +9,7 @@ from redis_queue import enqueue, get_redis
 from collections import defaultdict
 from time import time
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, unquote
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
@@ -401,16 +401,22 @@ async def cmd_start(message: types.Message):
     if message.text and len(message.text.split()) > 1:
         param = message.text.split()[1]
         
+        # Декодируем URL-кодированный параметр
+        try:
+            decoded_param = unquote(param)
+        except:
+            decoded_param = param  # Fallback если декодирование не удалось
+        
         # Простая проверка - если это выглядит как домен, проверяем его
-        if "." in param and len(param) > 3:
+        if "." in decoded_param and len(decoded_param) > 3:
             # Это похоже на домен - просто запускаем проверку в ЛС
-            domain = extract_domain(param)
+            domain = extract_domain(decoded_param)
             if domain:
                 await message.answer(f"🔍 <b>Проверяю {domain}...</b>")
                 await handle_domain_logic(message, domain, short_mode=True)
                 return
             else:
-                await message.answer(f"❌ Некорректный домен: {param}")
+                await message.answer(f"❌ Некорректный домен: {decoded_param}")
                 return
     
     welcome_message = (
@@ -495,7 +501,7 @@ async def handle_bulk_domains_in_group(message: types.Message, domains: list, us
             row = []
             for domain in batch:
                 # Простой диплинк - /start domain (перезапуск проверки в ЛС)
-                deep_link = f"https://t.me/{bot_username}?start={domain}"
+                deep_link = f"https://t.me/{bot_username}?start={quote(domain)}"
                 row.append(InlineKeyboardButton(
                     text=f"📄 {domain}", 
                     url=deep_link
@@ -1417,7 +1423,8 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                     row = []
                     for domain in batch:
                         # Простой диплинк - /start domain.com (перезапуск проверки в ЛС)
-                        deep_link = f"https://t.me/{bot_username}?start={domain}"
+                        # URL-кодируем домен для корректной передачи
+                        deep_link = f"https://t.me/{bot_username}?start={quote(domain)}"
                         row.append(InlineKeyboardButton(text=f"📄 {domain}", url=deep_link))
                     buttons.append(row)
                 
@@ -1507,60 +1514,113 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
             start_time = time()
             cached = await r.get(f"result:{domain}")
             is_full_report = cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"])
-            if cached and (short_mode or is_full_report):
-                if short_mode:
-                    lines = cached.split("\n")
-                    filtered_lines = []
-                    include_next = False
-                    for line in lines:
-                        if any(k in line for k in ["🟢 Ping", "🔒 TLS", "🌐 HTTP", "🛡", "🟢 CDN", "🛰 Оценка пригодности"]):
-                            filtered_lines.append(line)
-                            include_next = True  # Включаем следующую строку (например, после "🔒 TLS")
-                        elif include_next and line.strip().startswith(("✅", "❌", "⏳")):
-                            filtered_lines.append(line)
-                            include_next = False
-                        else:
-                            include_next = False
-                    filtered = "\n".join(filtered_lines)
+            
+            # В группах - НЕ отправляем результаты, только создаем кнопку для получения в ЛС
+            if is_group_chat(message):
+                if cached and (short_mode or is_full_report):
+                    # Есть кэшированный результат - создаем кнопку для получения в ЛС
+                    bot_info = await bot.get_me()
+                    bot_username = bot_info.username
+                    deep_link = f"https://t.me/{bot_username}?start={quote(domain)}"
                     
-                    # Выбираем правильную кнопку в зависимости от типа чата
-                    if is_group_chat(message):
-                        keyboard = get_group_full_report_button(domain, user_id)
-                    else:
-                        keyboard = get_full_report_button(domain)
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text=f"📄 Получить результат в ЛС", url=deep_link)]
+                    ])
                     
                     await send_topic_aware_message(message,
-                        f"⚡ Результат из кэша для {domain}:\n\n{filtered}",
+                        f"✅ <b>{domain}</b> - результат готов!\nНажмите кнопку для получения в личных сообщениях:",
                         reply_markup=keyboard
                     )
                     await log_analytics("domain_check", user_id,
                                       domain=domain, check_type="short" if short_mode else "full",
                                       result_status="cached", execution_time=time() - start_time)
-                    logging.info(f"Returned cached short report for {domain} to user {user_id}")
+                    logging.info(f"Group: offered cached result for {domain} to user {user_id}")
                 else:
-                    await send_topic_aware_message(message, f"⚡ Полный результат из кэша для {domain}:\n\n{cached}")
-                    await log_analytics("domain_check", user_id,
-                                      domain=domain, check_type="full",
-                                      result_status="cached", execution_time=time() - start_time)
-                    logging.info(f"Returned cached full report for {domain} to user {user_id}")
+                    # Нет кэша - ставим в очередь и создаем кнопку
+                    chat_id = message.chat.id
+                    message_id = message.message_id
+                    thread_id = get_topic_thread_id(message)
+                    
+                    enqueued = await enqueue(domain, user_id, short_mode=short_mode,
+                                           chat_id=chat_id, message_id=message_id, thread_id=thread_id)
+                    
+                    bot_info = await bot.get_me()
+                    bot_username = bot_info.username
+                    deep_link = f"https://t.me/{bot_username}?start={quote(domain)}"
+                    
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text=f"📄 Получить результат в ЛС", url=deep_link)]
+                    ])
+                    
+                    if enqueued:
+                        await send_topic_aware_message(message, 
+                            f"✅ <b>{domain}</b> поставлен в очередь.\nРезультат будет доступен по кнопке ниже:",
+                            reply_markup=keyboard
+                        )
+                        await log_analytics("domain_check", user_id,
+                                          domain=domain, check_type="short" if short_mode else "full",
+                                          result_status="queued", execution_time=time() - start_time)
+                    else:
+                        await send_topic_aware_message(message, 
+                            f"⚠️ <b>{domain}</b> уже в очереди.\nРезультат будет доступен по кнопке ниже:",
+                            reply_markup=keyboard
+                        )
+                    logging.info(f"Group: enqueued {domain} for user {user_id} (short_mode={short_mode})")
+                
                 await r.lpush(f"history:{user_id}", f"{datetime.now().strftime('%Y-%m-%d %H:%M')} - {domain}")
                 await r.ltrim(f"history:{user_id}", 0, 9)
             else:
-                # Передаём контекст чата при постановке в очередь
-                chat_id = message.chat.id
-                message_id = message.message_id
-                thread_id = get_topic_thread_id(message)
-                
-                enqueued = await enqueue(domain, user_id, short_mode=short_mode,
-                                       chat_id=chat_id, message_id=message_id, thread_id=thread_id)
-                if enqueued:
-                    await send_topic_aware_message(message, f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт.")
-                    await log_analytics("domain_check", user_id,
-                                      domain=domain, check_type="short" if short_mode else "full",
-                                      result_status="queued", execution_time=time() - start_time)
+                # В ЛС - отправляем результаты как обычно
+                if cached and (short_mode or is_full_report):
+                    if short_mode:
+                        lines = cached.split("\n")
+                        filtered_lines = []
+                        include_next = False
+                        for line in lines:
+                            if any(k in line for k in ["🟢 Ping", "🔒 TLS", "🌐 HTTP", "🛡", "🟢 CDN", "🛰 Оценка пригодности"]):
+                                filtered_lines.append(line)
+                                include_next = True  # Включаем следующую строку (например, после "🔒 TLS")
+                            elif include_next and line.strip().startswith(("✅", "❌", "⏳")):
+                                filtered_lines.append(line)
+                                include_next = False
+                            else:
+                                include_next = False
+                        filtered = "\n".join(filtered_lines)
+                        
+                        keyboard = get_full_report_button(domain)
+                        
+                        await send_topic_aware_message(message,
+                            f"⚡ Результат из кэша для {domain}:\n\n{filtered}",
+                            reply_markup=keyboard
+                        )
+                        await log_analytics("domain_check", user_id,
+                                          domain=domain, check_type="short" if short_mode else "full",
+                                          result_status="cached", execution_time=time() - start_time)
+                        logging.info(f"Returned cached short report for {domain} to user {user_id}")
+                    else:
+                        await send_topic_aware_message(message, f"⚡ Полный результат из кэша для {domain}:\n\n{cached}")
+                        await log_analytics("domain_check", user_id,
+                                          domain=domain, check_type="full",
+                                          result_status="cached", execution_time=time() - start_time)
+                        logging.info(f"Returned cached full report for {domain} to user {user_id}")
+                    await r.lpush(f"history:{user_id}", f"{datetime.now().strftime('%Y-%m-%d %H:%M')} - {domain}")
+                    await r.ltrim(f"history:{user_id}", 0, 9)
                 else:
-                    await send_topic_aware_message(message, f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
-                logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
+                    # Передаём контекст чата при постановке в очередь
+                    chat_id = message.chat.id
+                    message_id = message.message_id
+                    thread_id = get_topic_thread_id(message)
+                    
+                    enqueued = await enqueue(domain, user_id, short_mode=short_mode,
+                                           chat_id=chat_id, message_id=message_id, thread_id=thread_id)
+                    if enqueued:
+                        await send_topic_aware_message(message, f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт.")
+                        await log_analytics("domain_check", user_id,
+                                          domain=domain, check_type="short" if short_mode else "full",
+                                          result_status="queued", execution_time=time() - start_time)
+                    else:
+                        await send_topic_aware_message(message, f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
+                    logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
     except Exception as e:
         logging.error(f"Failed to process domains for user {user_id}: {str(e)}")
         await send_topic_aware_message(message, f"❌ Ошибка: {str(e)}")
