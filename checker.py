@@ -19,7 +19,7 @@ os.makedirs(log_dir, exist_ok=True)
 
 # Создаем логгер для checker
 checker_logger = logging.getLogger("checker")
-checker_logger.setLevel(checker_logger.WARNING)  # Только WARNING и ERROR
+checker_logger.setLevel(logging.WARNING)  # Только WARNING и ERROR
 
 # Проверяем, есть ли уже обработчики (чтобы избежать дубликатов)
 if not checker_logger.handlers:
