@@ -3,7 +3,7 @@ import asyncio
 import json
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command, CommandStart, CommandObject
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, FSInputFile, Message, CallbackQuery
+from aiogram.types import BotCommand, FSInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ChatType
 import os
 import redis.asyncio as redis
@@ -82,6 +82,7 @@ PRIVATE_RATE_LIMIT_PER_MINUTE = int(os.getenv("PRIVATE_RATE_LIMIT_PER_MINUTE", "
 PRIVATE_DAILY_LIMIT = int(os.getenv("PRIVATE_DAILY_LIMIT", "100"))
 GROUP_MODE_ENABLED = os.getenv("GROUP_MODE_ENABLED", "true").lower() == "true"
 GROUP_COMMAND_PREFIX = os.getenv("GROUP_COMMAND_PREFIX", "!");
+GROUP_OUTPUT_MODE = os.getenv("GROUP_OUTPUT_MODE", "short").lower()  # "short" или "full"
 AUTHORIZED_GROUPS_STR = os.getenv("AUTHORIZED_GROUPS", "").strip()
 AUTHORIZED_GROUPS = set()
 if AUTHORIZED_GROUPS_STR:
@@ -105,7 +106,6 @@ analytics_collector = None
 # --- Redis Connection ---
 async def get_redis_connection() -> redis.Redis:
     try:
-        logging.info("Attempting to connect to Redis...")
         connection = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6379")),
@@ -115,7 +115,6 @@ async def get_redis_connection() -> redis.Redis:
         )
         # Проверяем соединение
         await connection.ping()
-        logging.info("✅ Redis connection successful")
         return connection
     except Exception as e:
         logging.error(f"❌ Failed to connect to Redis: {e}")
@@ -208,15 +207,6 @@ def get_admin_keyboard():
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_full_report_button(domain: str):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📄 Полный отчёт", callback_data=f"full_report:{domain}")]])
-
-def get_group_full_report_button(domain: str):
-    if not BOT_USERNAME: return None
-    encoded_domain = quote(domain)
-    deep_link = f"https://t.me/{BOT_USERNAME}?start=full_{encoded_domain}"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📄 Полный отчёт в ЛС", url=deep_link)]])
-
 # --- Limit Checks ---
 async def check_limits(user_id: int, is_group: bool, chat_id: Optional[int]) -> bool:
     r = await get_redis_connection()
@@ -264,16 +254,12 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
     is_group = is_group_chat(message)
     chat_id = message.chat.id if is_group else None
 
-    logging.info(f"handle_domain_logic: user={user_id}, text='{text}', short_mode={short_mode}, is_group={is_group}")
-
     if not await check_limits(user_id, is_group, chat_id):
         await send_topic_aware_message(message, "🚫 Превышен лимит запросов. Попробуйте позже.")
         return
 
     domains = re.split(r'[\s,]+', text)
     valid_domains = {d for d in (extract_domain(d) for d in domains) if d}
-
-    logging.info(f"Valid domains extracted: {valid_domains}")
 
     if not valid_domains:
         await send_topic_aware_message(message, "❌ Не найдено ни одного корректного домена для проверки.")
@@ -282,27 +268,23 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
     r = await get_redis_connection()
     try:
         user_mode_is_short = (await r.get(f"mode:{user_id}")) != "full"
-        final_short_mode = short_mode and user_mode_is_short
-
-        logging.info(f"User mode: {'short' if user_mode_is_short else 'full'}, final_short_mode: {final_short_mode}")
+        
+        # Для групп используем GROUP_OUTPUT_MODE, для личек - настройки пользователя
+        if is_group:
+            final_short_mode = short_mode and (GROUP_OUTPUT_MODE == "short")
+        else:
+            final_short_mode = short_mode and user_mode_is_short
 
         for domain in valid_domains:
             try:
                 cached_result = await r.get(f"result:{domain}")
-                logging.info(f"Domain {domain}: cached_result exists: {bool(cached_result)}")
                 if cached_result and (not final_short_mode or "краткий" in cached_result.lower()):
-                    # Показываем кнопку "Полный отчёт" только если это краткий режим
-                    keyboard = None
-                    if final_short_mode:
-                        if is_group:
-                            keyboard = get_group_full_report_button(domain)
-                            logging.info(f"Using group keyboard for {domain}")
-                        else:
-                            keyboard = get_full_report_button(domain)
-                            logging.info(f"Using private keyboard for {domain}")
-                    await send_topic_aware_message(message, cached_result, reply_markup=keyboard)
+                    # Для групп добавляем инструкцию о полном отчете, если режим короткий
+                    response_text = cached_result
+                    if is_group and GROUP_OUTPUT_MODE == "short":
+                        response_text += "\n\n💡 <i>Для полного логирования выполните повторный запрос в ЛС боту.</i>"
+                    await send_topic_aware_message(message, response_text)
                 else:
-                    logging.info(f"Enqueueing domain {domain} for processing")
                     await enqueue(domain, user_id, final_short_mode, message.chat.id, message.message_id, message.message_thread_id)
                     await send_topic_aware_message(message, f"✅ Домен <b>{domain}</b> добавлен в очередь на проверку.")
                 await log_analytics("domain_check", user_id, domain=domain, mode="short" if final_short_mode else "full")
@@ -324,40 +306,31 @@ async def cmd_start(message: Message, command: Optional[CommandObject] = None):
     if not message.from_user: return
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
-
-    logging.info(f"cmd_start called by user {user_id}, command: {command}")
     
     if command and command.args:
         param = command.args
-        logging.info(f"Deep link from {user_id}: '{param}'")
         try:
             decoded_param = unquote(param)
-            logging.info(f"Decoded param: '{decoded_param}'")
         except Exception as e:
             logging.warning(f"Failed to decode param '{param}': {e}")
             decoded_param = param
 
         if decoded_param.startswith("full_"):
             domain = extract_domain(decoded_param[5:])
-            logging.info(f"Full report requested for domain: '{domain}'")
             if domain:
                 await send_topic_aware_message(message, f"📄 <b>Получаю полный отчет для {domain}...</b>")
                 await handle_domain_logic(message, domain, short_mode=False)
             else:
-                logging.warning(f"Invalid domain in full report link: '{decoded_param[5:]}'")
                 await send_topic_aware_message(message, f"❌ Некорректный домен в ссылке: {decoded_param[5:]}")
         else:
             domain = extract_domain(decoded_param)
-            logging.info(f"Short report requested for domain: '{domain}'")
             if domain:
                 await send_topic_aware_message(message, f"🔍 <b>Получаю результат для {domain}...</b>")
                 await handle_domain_logic(message, domain, short_mode=True)
             else:
-                logging.warning(f"Unknown deep-link parameter: '{decoded_param}'")
                 await send_topic_aware_message(message, f"❌ Неизвестный параметр deep-link: {decoded_param}")
         return
 
-    logging.info(f"Regular /start command from user {user_id}")
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов.\n\n"
         "Отправь мне домен для проверки, например: <code>google.com</code>\n"
@@ -606,13 +579,6 @@ async def cq_history(call: CallbackQuery):
     finally:
         await r.aclose()
     await call.answer()
-
-@router.callback_query(F.data.startswith("full_report:"))
-async def cq_full_report(call: CallbackQuery):
-    if not call.message or not isinstance(call.message, types.Message) or not call.from_user or not call.data: return
-    domain = call.data.split(":", 1)[1]
-    await call.answer(f"📄 Запрашиваю полный отчет для {domain}...")
-    await handle_domain_logic(call.message, domain, short_mode=False)
 
 @router.callback_query(F.data == "admin_panel")
 async def cq_admin_panel(call: CallbackQuery):

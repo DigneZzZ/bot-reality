@@ -6,8 +6,6 @@ import json
 from logging.handlers import RotatingFileHandler
 from redis_queue import get_redis
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from bot import get_full_report_button
 from checker import run_check  # Импорт функции из checker.py
 from datetime import datetime
 from typing import Optional
@@ -38,6 +36,7 @@ logging.basicConfig(
 # Инициализация Telegram Bot
 TOKEN = os.getenv("BOT_TOKEN")
 SAVE_APPROVED_DOMAINS = os.getenv("SAVE_APPROVED_DOMAINS", "false").lower() == "true"
+GROUP_OUTPUT_MODE = os.getenv("GROUP_OUTPUT_MODE", "short").lower()  # "short" или "full"
 if not TOKEN:
     logging.error("BOT_TOKEN environment variable is not set")
     raise ValueError("BOT_TOKEN environment variable is not set")
@@ -162,25 +161,6 @@ async def cache_cleanup_task(r: redis.Redis):
         await clear_cache(r)
         await asyncio.sleep(86400)
 
-def get_group_full_report_button(domain: str, user_id: int):
-    """Создаёт кнопку с deep link для получения полного отчёта в ЛС"""
-    bot_username = os.getenv("BOT_USERNAME", "bot")  # Замените на актуальное имя бота
-    deep_link = f"https://t.me/{bot_username}?start=full_{domain}"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", url=deep_link)]
-    ])
-    return keyboard
-
-def get_deep_link_button(domain: str):
-    """Создаёт кнопку с deep link на бота для получения полного отчёта"""
-    # Получаем имя бота из токена или используем переменную окружения
-    bot_username = os.getenv("BOT_USERNAME", "bot")  # Замените на актуальное имя бота
-    deep_link = f"https://t.me/{bot_username}?start=full_{domain}"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Получить полный отчёт", url=deep_link)]
-    ])
-    return keyboard
-
 async def send_group_reply(chat_id: int, message_id: Optional[int], thread_id: Optional[int], text: str, reply_markup=None):
     """Отправляет ответ в группу с поддержкой тем и reply"""
     try:
@@ -267,30 +247,20 @@ async def worker():
                     is_group = chat_id != user_id
                     
                     if is_group:
-                        # В группе отвечаем кратким отчётом с кнопкой "Полный в ЛС"
-                        if short_mode:
-                            # Краткий отчёт + кнопка для полного в ЛС
-                            keyboard = get_group_full_report_button(domain, user_id)
-                            await send_group_reply(chat_id, message_id, thread_id, result, keyboard)
+                        # В группе используем GROUP_OUTPUT_MODE
+                        if GROUP_OUTPUT_MODE == "short":
+                            # Краткий отчёт с инструкцией о ЛС
+                            group_message = result + "\n\n💡 <i>Для полного логирования выполните повторный запрос в ЛС боту.</i>"
+                            await send_group_reply(chat_id, message_id, thread_id, group_message)
                         else:
-                            # Полный отчёт пытаемся отправить в ЛС
-                            try:
-                                await bot.send_message(user_id, f"📄 Полный отчёт для {domain}:\n\n{result}")
-                                # В группе уведомляем об успешной отправке
-                                await send_group_reply(chat_id, message_id, thread_id, 
-                                                     f"✅ Полный отчёт для <b>{domain}</b> отправлен вам в личные сообщения.")
-                            except Exception as pm_error:
-                                # Не удалось отправить в ЛС (скорее всего диалог не начат)
-                                logging.warning(f"Failed to send PM to user {user_id}: {pm_error}")
-                                
-                                # Отправляем уведомление с кнопкой deep link
-                                warning_text = f"⚠️ Не удалось отправить полный отчёт в ЛС для <b>{domain}</b>"
-                                deep_link_keyboard = get_deep_link_button(domain)
-                                await send_group_reply(chat_id, message_id, thread_id, warning_text, deep_link_keyboard)
+                            # Полный отчёт в группе
+                            await send_group_reply(chat_id, message_id, thread_id, result)
                     else:
                         # В ЛС отправляем как обычно
-                        await bot.send_message(user_id, result, 
-                                             reply_markup=get_full_report_button(domain) if short_mode else None)
+                        final_message = result
+                        if short_mode:
+                            final_message += "\n\n💡 <i>Для полного отчета отправьте запрос повторно с параметром full.</i>"
+                        await bot.send_message(user_id, final_message)
                 except Exception as e:
                     logging.error(f"Failed to send message to chat {chat_id} for {domain}: {str(e)}")
             except Exception as e:
