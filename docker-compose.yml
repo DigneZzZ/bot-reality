@@ -13,6 +13,7 @@ services:
       - redis
     volumes:
       - ./approved_domains.txt:/app/approved_domains.txt
+      - geoip2_data:/app/data  # Постоянное хранение базы данных GeoIP2
     tmpfs:
       - /tmp:size=50M
     restart: unless-stopped
@@ -41,6 +42,7 @@ services:
       - redis
     volumes:
       - ./approved_domains.txt:/app/approved_domains.txt
+      - geoip2_data:/app/data  # Постоянное хранение базы данных GeoIP2
     tmpfs:
       - /tmp:size=50M
     restart: unless-stopped
@@ -79,3 +81,4 @@ services:
         compress: "true"
 volumes:
   redis_data:
+  geoip2_data:  # Volume для хранения базы данных GeoIP2

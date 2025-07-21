@@ -11,6 +11,9 @@ import dns.resolver
 import re
 from logging.handlers import RotatingFileHandler
 import os
+import geoip2.database
+import geoip2.errors
+import json
 
 # Настройка логирования с ротацией
 log_dir = os.getenv("LOG_DIR", "/app")
@@ -145,6 +148,163 @@ def get_ip_info(ip, timeout=5):
     except Exception as e:
         checker_logger.error(f"IP info check failed for {ip}: {str(e)}")
         return "N/A", "N/A"
+
+def get_geoip2_info(ip, geoip_db_path=None):
+    """Получает геолокацию из GeoIP2 базы данных."""
+    if not geoip_db_path:
+        # Сначала проверяем переменную окружения
+        geoip_db_path = os.getenv("GEOIP2_DB_PATH")
+        
+        if not geoip_db_path:
+            # Попробуем найти стандартные пути для GeoLite2
+            possible_paths = [
+                '/app/data/GeoLite2-City.mmdb',  # Docker volume
+                '/var/lib/geoip/GeoLite2-City.mmdb',  # Ubuntu стандартный путь
+                '/usr/share/GeoIP/GeoLite2-City.mmdb',  # Ubuntu альтернативный
+                '/opt/geoip/GeoLite2-City.mmdb',  # Пользовательская установка
+                './GeoLite2-City.mmdb',  # Текущая директория
+                'GeoLite2-City.mmdb',  # Текущая директория
+                os.path.join(os.getcwd(), "GeoLite2-City.mmdb"),  # Полный путь к текущей директории
+                os.path.join(os.getenv("LOG_DIR", "/tmp"), "GeoLite2-City.mmdb")
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    geoip_db_path = path
+                    break
+        
+        if not geoip_db_path or not os.path.exists(geoip_db_path):
+            # Отладочная информация
+            env_path = os.getenv("GEOIP2_DB_PATH")
+            current_dir = os.getcwd()
+            checker_logger.info(f"GeoIP2 debug: env_path={env_path}, current_dir={current_dir}")
+            return "⚠️ GeoIP2 база данных не найдена"
+    
+    try:
+        with geoip2.database.Reader(geoip_db_path) as reader:
+            response = reader.city(ip)
+            
+            country = response.country.name or "N/A"
+            country_code = response.country.iso_code or "N/A"
+            city = response.city.name or "N/A"
+            region = response.subdivisions.most_specific.name or "N/A"
+            
+            # Координаты
+            lat = response.location.latitude
+            lon = response.location.longitude
+            coords = f"{lat:.4f}, {lon:.4f}" if lat and lon else "N/A"
+            
+            return {
+                'country': country,
+                'country_code': country_code,
+                'region': region,
+                'city': city,
+                'coordinates': coords,
+                'accuracy_radius': response.location.accuracy_radius
+            }
+            
+    except geoip2.errors.AddressNotFoundError:
+        return "❌ IP не найден в GeoIP2 базе"
+    except FileNotFoundError:
+        return "❌ GeoIP2 база данных не найдена"
+    except Exception as e:
+        checker_logger.error(f"GeoIP2 lookup failed for {ip}: {str(e)}")
+        return f"❌ GeoIP2 ошибка: {str(e)}"
+
+def get_ripe_ncc_info(ip, timeout=10):
+    """Получает информацию об IP из RIPE NCC базы данных."""
+    try:
+        # RIPE NCC REST API
+        url = f"https://rest.db.ripe.net/search.json"
+        params = {
+            'query-string': ip,
+            'source': 'ripe',
+            'type-filter': 'inetnum,inet6num,route,route6,aut-num'
+        }
+        
+        response = requests.get(url, params=params, timeout=timeout)
+        data = response.json()
+        
+        if 'objects' not in data or not data['objects']['object']:
+            return "❌ Информация не найдена в RIPE NCC"
+        
+        info = {}
+        for obj in data['objects']['object']:
+            obj_type = obj.get('type', '')
+            attributes = obj.get('attributes', {}).get('attribute', [])
+            
+            if obj_type in ['inetnum', 'inet6num']:
+                for attr in attributes:
+                    attr_name = attr.get('name', '')
+                    attr_value = attr.get('value', '')
+                    
+                    if attr_name == 'netname':
+                        info['network_name'] = attr_value
+                    elif attr_name == 'country':
+                        info['country'] = attr_value
+                    elif attr_name == 'org':
+                        info['organization_ref'] = attr_value
+                    elif attr_name == 'admin-c':
+                        info['admin_contact'] = attr_value
+                    elif attr_name == 'tech-c':
+                        info['tech_contact'] = attr_value
+                    elif attr_name == 'status':
+                        info['status'] = attr_value
+                    elif attr_name == 'descr':
+                        if 'description' not in info:
+                            info['description'] = []
+                        info['description'].append(attr_value)
+        
+        return info if info else "❌ Детальная информация недоступна"
+        
+    except requests.exceptions.RequestException as e:
+        checker_logger.error(f"RIPE NCC request failed for {ip}: {str(e)}")
+        return f"❌ RIPE NCC недоступен: {str(e)}"
+    except Exception as e:
+        checker_logger.error(f"RIPE NCC lookup failed for {ip}: {str(e)}")
+        return f"❌ RIPE NCC ошибка: {str(e)}"
+
+def get_enhanced_ip_info(ip, timeout=10):
+    """Расширенная информация об IP с использованием нескольких источников."""
+    results = {}
+    
+    # Базовая информация через ip-api.com
+    basic_loc, basic_asn = get_ip_info(ip, timeout)
+    results['basic'] = {
+        'location': basic_loc,
+        'asn': basic_asn
+    }
+    
+    # GeoIP2 информация
+    geoip2_info = get_geoip2_info(ip)
+    results['geoip2'] = geoip2_info
+    
+    # RIPE NCC информация (только если включено)
+    ripe_enabled = os.getenv("RIPE_NCC_ENABLED", "true").lower() == "true"
+    if ripe_enabled:
+        ripe_info = get_ripe_ncc_info(ip, timeout)
+        results['ripe_ncc'] = ripe_info
+    else:
+        results['ripe_ncc'] = "🔕 RIPE NCC отключен в настройках"
+    
+    # Дополнительная проверка через ipinfo.io для кросс-валидации
+    try:
+        ipinfo_response = requests.get(f"https://ipinfo.io/{ip}/json", timeout=timeout)
+        if ipinfo_response.status_code == 200:
+            ipinfo_data = ipinfo_response.json()
+            results['ipinfo'] = {
+                'city': ipinfo_data.get('city', 'N/A'),
+                'region': ipinfo_data.get('region', 'N/A'),
+                'country': ipinfo_data.get('country', 'N/A'),
+                'org': ipinfo_data.get('org', 'N/A'),
+                'postal': ipinfo_data.get('postal', 'N/A'),
+                'timezone': ipinfo_data.get('timezone', 'N/A')
+            }
+    except Exception as e:
+        checker_logger.warning(f"Failed to fetch ipinfo.io for {ip}: {str(e)}")
+        results['ipinfo'] = "❌ ipinfo.io недоступен"
+    
+    return results
 
 def scan_ports(ip, ports=[80, 443, 8080, 8443], timeout=1):
     """Сканирует указанные порты на IP."""
@@ -291,9 +451,14 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
 
     # ↓↓↓ ASN и CDN определяются один раз ↓↓↓
     loc, asn = "N/A", "N/A"
+    enhanced_ip_info = None
     cdn = None
     try:
-        loc, asn = get_ip_info(ip)
+        # Используем расширенную функцию для получения IP информации
+        enhanced_ip_info = get_enhanced_ip_info(ip)
+        # Берем базовую информацию для совместимости
+        loc = enhanced_ip_info['basic']['location']
+        asn = enhanced_ip_info['basic']['asn']
         cdn = detect_cdn(http, asn)
     except Exception as e:
         checker_logger.warning(f"CDN detection failed for {domain}: {str(e)}")
@@ -343,6 +508,59 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         report.append("\n🌍 География и ASN")
         report.append(f"📍 IP: {loc}")
         report.append(f"🏢 ASN: {asn}")
+        
+        # Добавляем расширенную информацию, если доступна
+        if enhanced_ip_info:
+            # GeoIP2 информация
+            geoip2_data = enhanced_ip_info.get('geoip2')
+            if isinstance(geoip2_data, dict):
+                report.append("\n📊 GeoIP2 данные:")
+                report.append(f"🗺️ {geoip2_data.get('country', 'N/A')} ({geoip2_data.get('country_code', 'N/A')})")
+                report.append(f"🏙️ {geoip2_data.get('region', 'N/A')} / {geoip2_data.get('city', 'N/A')}")
+                if geoip2_data.get('coordinates') != 'N/A':
+                    report.append(f"📍 Координаты: {geoip2_data.get('coordinates')}")
+                if geoip2_data.get('accuracy_radius'):
+                    report.append(f"� Точность: ±{geoip2_data.get('accuracy_radius')} км")
+            elif isinstance(geoip2_data, str):
+                report.append(f"📊 GeoIP2: {geoip2_data}")
+            
+            # RIPE NCC информация
+            ripe_data = enhanced_ip_info.get('ripe_ncc')
+            if isinstance(ripe_data, dict):
+                report.append("\n📋 RIPE NCC данные:")
+                if ripe_data.get('network_name'):
+                    report.append(f"🌐 Сеть: {ripe_data['network_name']}")
+                if ripe_data.get('country'):
+                    report.append(f"🏳️ Страна: {ripe_data['country']}")
+                if ripe_data.get('organization_ref'):
+                    report.append(f"🏢 Организация: {ripe_data['organization_ref']}")
+                if ripe_data.get('status'):
+                    report.append(f"📊 Статус: {ripe_data['status']}")
+                if ripe_data.get('description'):
+                    descriptions = ripe_data['description'][:2]  # Показываем только первые 2
+                    for desc in descriptions:
+                        report.append(f"📝 {desc}")
+            elif isinstance(ripe_data, str):
+                report.append(f"📋 RIPE NCC: {ripe_data}")
+            
+            # ipinfo.io для кросс-валидации
+            ipinfo_data = enhanced_ip_info.get('ipinfo')
+            if isinstance(ipinfo_data, dict):
+                report.append("\n🔍 ipinfo.io (валидация):")
+                location_parts = []
+                if ipinfo_data.get('city') != 'N/A':
+                    location_parts.append(ipinfo_data['city'])
+                if ipinfo_data.get('region') != 'N/A':
+                    location_parts.append(ipinfo_data['region'])
+                if ipinfo_data.get('country') != 'N/A':
+                    location_parts.append(ipinfo_data['country'])
+                if location_parts:
+                    report.append(f"📍 {' / '.join(location_parts)}")
+                if ipinfo_data.get('org') != 'N/A':
+                    report.append(f"🏢 {ipinfo_data['org']}")
+                if ipinfo_data.get('timezone') != 'N/A':
+                    report.append(f"🕐 Часовой пояс: {ipinfo_data['timezone']}")
+        
         report.append(check_spamhaus(ip))
         report.append(ping_result)
 
