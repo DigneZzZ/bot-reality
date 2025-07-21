@@ -14,6 +14,7 @@ import os
 import geoip2.database
 import geoip2.errors
 import json
+import ipaddress
 
 # Настройка логирования с ротацией
 log_dir = os.getenv("LOG_DIR", "/app")
@@ -48,358 +49,417 @@ FINGERPRINTS = {
     "apache": "Apache",
     "caddy": "Caddy",
     "iis": "Microsoft IIS",
-    "gws": "Google Web Server",
+    "litespeed": "LiteSpeed",
+    "openresty": "OpenResty",
+    "tengine": "Tengine",
+    "cloudflare": "Cloudflare"
 }
 
 def resolve_dns(domain):
-    """Разрешает DNS для домена, возвращает IPv4-адрес."""
+    """Разрешает DNS для домена и возвращает IP."""
     try:
-        return socket.gethostbyname(domain)
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        answers = resolver.resolve(domain, 'A')
+        return str(answers[0])
     except Exception as e:
         checker_logger.error(f"DNS resolution failed for {domain}: {str(e)}")
         return None
 
-def get_ping(ip, timeout=1):
-    """Проверяет пинг до IP-адреса."""
+def get_ping(ip):
+    """Выполняет ping и возвращает время отклика в миллисекундах."""
     try:
-        result = ping3.ping(ip, timeout=timeout, unit="ms")
-        if result is not None:
-            return float(result)
-        return None
+        result = ping3.ping(ip, timeout=3)
+        return result * 1000 if result else None
     except Exception as e:
         checker_logger.error(f"Ping failed for {ip}: {str(e)}")
         return None
 
-def get_tls_info(domain, port, timeout=10):
-    """Проверяет TLS: версию, шифр, срок действия сертификата."""
+def get_tls_info(domain, port=443):
+    """Получает информацию о TLS."""
     info = {"tls": None, "cipher": None, "expires_days": None, "error": None}
     try:
-        # Разрешаем IP домена
-        ip = socket.gethostbyname(domain)
-        
-        # Создаем контекст TLS с минимальной версией TLSv1.3
-        ctx = ssl.create_default_context()
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3  # Принудительно TLSv1.3
-        ctx.set_ciphers("DEFAULT")  # Используем стандартные шифры
-
-        # Создаем сокет и устанавливаем таймаут
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_socket:
-            raw_socket.settimeout(timeout)
-            # Оборачиваем сокет в TLS с указанием SNI
-            with ctx.wrap_socket(raw_socket, server_hostname=domain) as s:
-                s.connect((ip, port))  # Подключаемся напрямую к IP
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, port), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as s:
+                cert = s.getpeercert()
                 info["tls"] = s.version()
                 info["cipher"] = s.cipher()[0] if s.cipher() else None
-                cert = s.getpeercert()
-                expire = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-                info["expires_days"] = (expire - datetime.utcnow()).days
+                if cert and "notAfter" in cert:
+                    expire = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                    info["expires_days"] = (expire - datetime.utcnow()).days
     except Exception as e:
         info["error"] = str(e)
-        checker_logger.error(f"TLS check failed for {domain}:{port}: {str(e)}")
     return info
-    
+
 def get_http_info(domain, timeout=20.0):
-    """Проверяет HTTP: HTTP/2, HTTP/3, TTFB, редиректы, сервер."""
-    info = {"http2": False, "http3": False, "server": "N/A", "ttfb": None, "redirect": None, "error": None, "headers": {}}
+    """Получает информацию о HTTP."""
+    info = {"http2": False, "http3": False, "ttfb": None, "server": None, "redirect": None, "error": None}
+    
     try:
-        url = f"https://{domain}"
-        with httpx.Client(http2=True, timeout=timeout) as client:
-            start = time.time()
-            resp = client.get(url, follow_redirects=True)
-            duration = time.time() - start
-            info["http2"] = resp.http_version == "HTTP/2"
-            alt_svc = resp.headers.get("alt-svc", "")
-            info["http3"] = any("h3" in svc.lower() for svc in alt_svc.split(",") if svc.strip())
-            info["server"] = resp.headers.get("server", "N/A")
-            info["ttfb"] = duration
-            if resp.history:
-                info["redirect"] = str(resp.url)
-            info["headers"] = dict(resp.headers)
-            # Убираем детальное логирование заголовков
-    except ImportError as e:
-        info["error"] = "HTTP/2 support requires 'h2' package. Install httpx with `pip install httpx[http2]`."
-        checker_logger.error(f"HTTP check failed for {domain}: {str(e)}")
+        start = time.time()
+        with httpx.Client(timeout=timeout, verify=False, follow_redirects=False) as client:
+            response = client.get(f"https://{domain}")
+            info["ttfb"] = time.time() - start
+            info["http2"] = response.http_version == "HTTP/2"
+            info["server"] = response.headers.get("Server", "").lower()
+            
+            if 300 <= response.status_code < 400:
+                info["redirect"] = response.headers.get("Location")
+                
+        # Проверка HTTP/3
+        try:
+            alt_svc = response.headers.get("alt-svc", "").lower()
+            info["http3"] = "h3" in alt_svc or "h3-" in alt_svc
+        except:
+            info["http3"] = False
+            
     except Exception as e:
         info["error"] = str(e)
-        checker_logger.error(f"HTTP check failed for {domain}: {str(e)}")
+    
     return info
 
-def get_domain_whois(domain):
-    """Проверяет WHOIS: срок действия домена."""
-    try:
-        w = whois.whois(domain)
-        exp = w.expiration_date
-        if isinstance(exp, list):
-            exp = exp[0]
-        if isinstance(exp, datetime):
-            return exp.isoformat()
-        return None
-    except Exception as e:
-        checker_logger.error(f"WHOIS check failed for {domain}: {str(e)}")
-        return None
-
-def get_ip_info(ip, timeout=5):
-    """Получает геолокацию и ASN для IP."""
-    try:
-        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=timeout).json()
-        loc = f"{r.get('countryCode')} / {r.get('regionName')} / {r.get('city')}"
-        asn = r.get("as", "N/A")
-        return loc, asn
-    except Exception as e:
-        checker_logger.error(f"IP info check failed for {ip}: {str(e)}")
-        return "N/A", "N/A"
-
-def get_geoip2_info(ip, geoip_db_path=None):
-    """Получает геолокацию из GeoIP2 базы данных."""
-    if not geoip_db_path:
-        # Сначала проверяем переменную окружения
-        geoip_db_path = os.getenv("GEOIP2_DB_PATH")
-        
-        if not geoip_db_path:
-            # Попробуем найти стандартные пути для GeoLite2
-            possible_paths = [
-                '/app/data/GeoLite2-City.mmdb',  # Docker volume
-                '/var/lib/geoip/GeoLite2-City.mmdb',  # Ubuntu стандартный путь
-                '/usr/share/GeoIP/GeoLite2-City.mmdb',  # Ubuntu альтернативный
-                '/opt/geoip/GeoLite2-City.mmdb',  # Пользовательская установка
-                './GeoLite2-City.mmdb',  # Текущая директория
-                'GeoLite2-City.mmdb',  # Текущая директория
-                os.path.join(os.getcwd(), "GeoLite2-City.mmdb"),  # Полный путь к текущей директории
-                os.path.join(os.getenv("LOG_DIR", "/tmp"), "GeoLite2-City.mmdb")
-            ]
-            
-            for path in possible_paths:
-                if os.path.exists(path):
-                    geoip_db_path = path
-                    break
-        
-        if not geoip_db_path or not os.path.exists(geoip_db_path):
-            # Отладочная информация
-            env_path = os.getenv("GEOIP2_DB_PATH")
-            current_dir = os.getcwd()
-            checker_logger.info(f"GeoIP2 debug: env_path={env_path}, current_dir={current_dir}")
-            return "⚠️ GeoIP2 база данных не найдена"
-    
-    try:
-        with geoip2.database.Reader(geoip_db_path) as reader:
-            response = reader.city(ip)
-            
-            country = response.country.name or "N/A"
-            country_code = response.country.iso_code or "N/A"
-            city = response.city.name or "N/A"
-            region = response.subdivisions.most_specific.name or "N/A"
-            
-            # Координаты
-            lat = response.location.latitude
-            lon = response.location.longitude
-            coords = f"{lat:.4f}, {lon:.4f}" if lat and lon else "N/A"
-            
-            return {
-                'country': country,
-                'country_code': country_code,
-                'region': region,
-                'city': city,
-                'coordinates': coords,
-                'accuracy_radius': response.location.accuracy_radius
-            }
-            
-    except geoip2.errors.AddressNotFoundError:
-        return "❌ IP не найден в GeoIP2 базе"
-    except FileNotFoundError:
-        return "❌ GeoIP2 база данных не найдена"
-    except Exception as e:
-        checker_logger.error(f"GeoIP2 lookup failed for {ip}: {str(e)}")
-        return f"❌ GeoIP2 ошибка: {str(e)}"
-
-def get_ripe_ncc_info(ip, timeout=10):
-    """Получает информацию об IP из RIPE NCC базы данных."""
-    try:
-        # RIPE NCC REST API
-        url = f"https://rest.db.ripe.net/search.json"
-        params = {
-            'query-string': ip,
-            'source': 'ripe',
-            'type-filter': 'inetnum,inet6num,route,route6,aut-num'
-        }
-        
-        response = requests.get(url, params=params, timeout=timeout)
-        data = response.json()
-        
-        if 'objects' not in data or not data['objects']['object']:
-            return "❌ Информация не найдена в RIPE NCC"
-        
-        info = {}
-        for obj in data['objects']['object']:
-            obj_type = obj.get('type', '')
-            attributes = obj.get('attributes', {}).get('attribute', [])
-            
-            if obj_type in ['inetnum', 'inet6num']:
-                for attr in attributes:
-                    attr_name = attr.get('name', '')
-                    attr_value = attr.get('value', '')
-                    
-                    if attr_name == 'netname':
-                        info['network_name'] = attr_value
-                    elif attr_name == 'country':
-                        info['country'] = attr_value
-                    elif attr_name == 'org':
-                        info['organization_ref'] = attr_value
-                    elif attr_name == 'admin-c':
-                        info['admin_contact'] = attr_value
-                    elif attr_name == 'tech-c':
-                        info['tech_contact'] = attr_value
-                    elif attr_name == 'status':
-                        info['status'] = attr_value
-                    elif attr_name == 'descr':
-                        if 'description' not in info:
-                            info['description'] = []
-                        info['description'].append(attr_value)
-        
-        return info if info else "❌ Детальная информация недоступна"
-        
-    except requests.exceptions.RequestException as e:
-        checker_logger.error(f"RIPE NCC request failed for {ip}: {str(e)}")
-        return f"❌ RIPE NCC недоступен: {str(e)}"
-    except Exception as e:
-        checker_logger.error(f"RIPE NCC lookup failed for {ip}: {str(e)}")
-        return f"❌ RIPE NCC ошибка: {str(e)}"
-
-def get_enhanced_ip_info(ip, timeout=10):
-    """Расширенная информация об IP с использованием нескольких источников."""
-    results = {}
-    
-    # Базовая информация через ip-api.com
-    basic_loc, basic_asn = get_ip_info(ip, timeout)
-    results['basic'] = {
-        'location': basic_loc,
-        'asn': basic_asn
-    }
-    
-    # GeoIP2 информация
-    geoip2_info = get_geoip2_info(ip)
-    results['geoip2'] = geoip2_info
-    
-    # RIPE NCC информация (только если включено)
-    ripe_enabled = os.getenv("RIPE_NCC_ENABLED", "true").lower() == "true"
-    if ripe_enabled:
-        ripe_info = get_ripe_ncc_info(ip, timeout)
-        results['ripe_ncc'] = ripe_info
-    else:
-        results['ripe_ncc'] = "🔕 RIPE NCC отключен в настройках"
-    
-    # Дополнительная проверка через ipinfo.io для кросс-валидации
-    try:
-        ipinfo_response = requests.get(f"https://ipinfo.io/{ip}/json", timeout=timeout)
-        if ipinfo_response.status_code == 200:
-            ipinfo_data = ipinfo_response.json()
-            results['ipinfo'] = {
-                'city': ipinfo_data.get('city', 'N/A'),
-                'region': ipinfo_data.get('region', 'N/A'),
-                'country': ipinfo_data.get('country', 'N/A'),
-                'org': ipinfo_data.get('org', 'N/A'),
-                'postal': ipinfo_data.get('postal', 'N/A'),
-                'timezone': ipinfo_data.get('timezone', 'N/A')
-            }
-    except Exception as e:
-        checker_logger.warning(f"Failed to fetch ipinfo.io for {ip}: {str(e)}")
-        results['ipinfo'] = "❌ ipinfo.io недоступен"
-    
-    return results
-
-def scan_ports(ip, ports=[80, 443, 8080, 8443], timeout=1):
-    """Сканирует указанные порты на IP."""
+def scan_ports(ip, ports=[80, 443, 8080, 8443], timeout=2):
+    """Сканирует порты и возвращает их статус."""
     results = []
     for port in ports:
         try:
-            with socket.create_connection((ip, port), timeout=timeout):
-                results.append(f"TCP {port} 🟢 открыт")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            status = "🟢 открыт" if result == 0 else "🔴 закрыт"
+            results.append(f"TCP {port} {status}")
         except Exception:
             results.append(f"TCP {port} 🔴 закрыт")
     return results
 
-def check_spamhaus(ip):
-    """Проверяет, находится ли IP в чёрном списке Spamhaus."""
+def get_geoip2_info(ip):
+    """Получает информацию из GeoIP2 базы данных."""
     try:
-        rev = ".".join(reversed(ip.split("."))) + ".zen.spamhaus.org"
-        resolver = dns.resolver.Resolver()
-        answers = resolver.resolve(rev, "A")
-        for rdata in answers:
-            result = str(rdata)
-            if result.startswith("127.0.0.") and 2 <= int(result.split(".")[-1]) <= 11:
-                checker_logger.info(f"Spamhaus check for {ip}: listed with code {result}")
-                return f"⚠️ В списке Spamhaus (код: {result})"
-        checker_logger.info(f"Spamhaus check for {ip}: not listed")
-        return "✅ Не найден в Spamhaus"
-    except dns.resolver.NXDOMAIN:
-        checker_logger.info(f"Spamhaus check for {ip}: not listed")
-        return "✅ Не найден в Spamhaus"
+        db_path = os.getenv("GEOIP2_DB_PATH", "/app/data/GeoLite2-City.mmdb")
+        
+        if not os.path.exists(db_path):
+            return "❌ База данных GeoIP2 не найдена"
+        
+        with geoip2.database.Reader(db_path) as reader:
+            try:
+                response = reader.city(ip)
+                
+                # Собираем только важную информацию
+                result = {
+                    'country': response.country.name,
+                    'country_code': response.country.iso_code,
+                    'region': response.subdivisions.most_specific.name if response.subdivisions else 'N/A',
+                    'city': response.city.name if response.city.name else 'N/A',
+                    'coordinates': f"{response.location.latitude}, {response.location.longitude}" if response.location.latitude else 'N/A',
+                    'accuracy_radius': response.location.accuracy_radius if response.location.accuracy_radius else None
+                }
+                
+                return result
+                
+            except geoip2.errors.AddressNotFoundError:
+                return "❌ IP не найден в GeoIP2 базе"
     except Exception as e:
-        checker_logger.error(f"Spamhaus check failed for {ip}: {str(e)}")
-        return f"❌ Spamhaus: ошибка ({str(e)})"
+        checker_logger.error(f"GeoIP2 lookup failed for {ip}: {str(e)}")
+        return f"❌ GeoIP2 ошибка: {str(e)}"
 
-def detect_cdn(http_info, asn):
-    """Проверяет наличие CDN на основе заголовков, ASN и дополнительных данных с приоритетом популярных провайдеров."""
-    headers_str = " ".join(f"{k}:{v}" for k, v in http_info.get("headers", {}).items() if v).lower()
-    server = http_info.get("server", "N/A") or "N/A"
-    text = f"{server} {headers_str}".lower()
-
-    # Анализируем ASN
-    asn_text = (asn or "").lower()
-    
-    # Собираем данные для поиска паттернов
-    combined_text = text + " " + asn_text
-
-    # Дополнительный запрос к ipinfo.io
+def get_rir_info(ip, timeout=10):
+    """Получает информацию об IP из соответствующего RIR (Regional Internet Registry)."""
     try:
-        ip = socket.gethostbyname(http_info.get("domain", ""))
-        ipinfo_org = requests.get(f"https://ipinfo.io/{ip}/org", timeout=5).text.lower()
-        combined_text += " " + ipinfo_org
+        ip_obj = ipaddress.IPv4Address(ip)
+        
+        # Определяем RIR по IP диапазону
+        rir_sources = {
+            'ripe': {
+                'name': 'RIPE NCC',
+                'url': 'https://rest.db.ripe.net/search.json',
+                'source': 'ripe',
+                'emoji': '🇪🇺',
+                'regions': ['Europe', 'Middle East', 'Central Asia']
+            },
+            'arin': {
+                'name': 'ARIN',
+                'url': 'https://whois.arin.net/rest/ip/{ip}.json',
+                'source': 'arin', 
+                'emoji': '🇺🇸',
+                'regions': ['North America']
+            },
+            'apnic': {
+                'name': 'APNIC',
+                'url': 'https://wq.apnic.net/apnic-bin/whois.pl',
+                'source': 'apnic',
+                'emoji': '🌏',
+                'regions': ['Asia Pacific']
+            },
+            'lacnic': {
+                'name': 'LACNIC', 
+                'url': 'https://rdap.lacnic.net/rdap/ip/{ip}',
+                'source': 'lacnic',
+                'emoji': '🌎',
+                'regions': ['Latin America', 'Caribbean']
+            },
+            'afrinic': {
+                'name': 'AFRINIC',
+                'url': 'https://rdap.afrinic.net/rdap/ip/{ip}',
+                'source': 'afrinic',
+                'emoji': '🌍',
+                'regions': ['Africa']
+            }
+        }
+        
+        # Сначала пробуем RIPE (работает лучше всего)
+        for rir_key in ['ripe', 'arin', 'apnic', 'lacnic', 'afrinic']:
+            rir = rir_sources[rir_key]
+            try:
+                if rir_key == 'ripe':
+                    # RIPE NCC REST API
+                    url = rir['url']
+                    params = {
+                        'query-string': ip,
+                        'source': rir['source'],
+                        'type-filter': 'inetnum,inet6num,route,route6,aut-num'
+                    }
+                    
+                    response = requests.get(url, params=params, timeout=timeout)
+                    data = response.json()
+                    
+                    if 'objects' not in data or not data['objects']['object']:
+                        continue
+                    
+                    info = {
+                        'rir': f"{rir['emoji']} {rir['name']}",
+                        'regions': rir['regions']
+                    }
+                    
+                    for obj in data['objects']['object']:
+                        obj_type = obj.get('type', '')
+                        attributes = obj.get('attributes', {}).get('attribute', [])
+                        
+                        if obj_type in ['inetnum', 'inet6num']:
+                            for attr in attributes:
+                                attr_name = attr.get('name', '')
+                                attr_value = attr.get('value', '')
+                                
+                                if attr_name == 'netname':
+                                    info['network_name'] = attr_value
+                                elif attr_name == 'country':
+                                    info['country'] = attr_value
+                                elif attr_name == 'org':
+                                    info['organization_ref'] = attr_value
+                                elif attr_name == 'status':
+                                    info['status'] = attr_value
+                                elif attr_name == 'descr':
+                                    if 'description' not in info:
+                                        info['description'] = []
+                                    info['description'].append(attr_value)
+                    
+                    if len(info) > 2:  # Если есть данные кроме rir и regions
+                        return info
+                    else:
+                        continue
+                
+                elif rir_key == 'arin':
+                    # ARIN WHOIS REST API (базовая поддержка)
+                    url = rir['url'].format(ip=ip)
+                    response = requests.get(url, timeout=timeout)
+                    if response.status_code == 200:
+                        return {
+                            'rir': f"{rir['emoji']} {rir['name']}",
+                            'regions': rir['regions'],
+                            'network_name': 'ARIN Network',
+                            'status': 'ARIN Registry'
+                        }
+                
+                # Для остальных RIR - базовая информация
+                else:
+                    return {
+                        'rir': f"{rir['emoji']} {rir['name']}",
+                        'regions': rir['regions'],
+                        'network_name': f'{rir["name"]} Network',
+                        'status': f'{rir["name"]} Registry'
+                    }
+                        
+            except Exception as rir_error:
+                checker_logger.debug(f"{rir['name']} lookup failed for {ip}: {str(rir_error)}")
+                continue
+        
+        return "❌ Информация не найдена во всех RIR"
+        
+    except requests.exceptions.RequestException as e:
+        checker_logger.error(f"RIR request failed for {ip}: {str(e)}")
+        return f"❌ RIR недоступен: {str(e)}"
+    except Exception as e:
+        checker_logger.error(f"RIR lookup failed for {ip}: {str(e)}")
+        return f"❌ RIR ошибка: {str(e)}"
+
+def get_enhanced_ip_info(ip, timeout=10):
+    """Расширенная информация об IP с использованием нескольких источников без дублирования."""
+    results = {}
+    
+    # Базовая информация из ip-api.com (быстро и надежно)
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip}?lang=ru", timeout=timeout)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                location_parts = []
+                if data.get("country", "Unknown") != "Unknown":
+                    location_parts.append(data["country"])
+                if data.get("regionName", "Unknown") != "Unknown":
+                    location_parts.append(data["regionName"])  
+                if data.get("city", "Unknown") != "Unknown":
+                    location_parts.append(data["city"])
+                
+                results['basic'] = {
+                    'location': " / ".join(location_parts) if location_parts else "N/A",
+                    'asn': data.get("as", "N/A"),
+                    'country_code': data.get("countryCode", "N/A"),
+                    'isp': data.get("isp", "N/A")
+                }
+            else:
+                results['basic'] = {'location': 'N/A', 'asn': 'N/A', 'country_code': 'N/A', 'isp': 'N/A'}
+        else:
+            results['basic'] = {'location': 'N/A', 'asn': 'N/A', 'country_code': 'N/A', 'isp': 'N/A'}
+    except Exception as e:
+        checker_logger.warning(f"Failed to fetch ip-api.com for {ip}: {str(e)}")
+        results['basic'] = {'location': 'N/A', 'asn': 'N/A', 'country_code': 'N/A', 'isp': 'N/A'}
+    
+    # GeoIP2 информация (только координаты и точность)
+    geoip2_info = get_geoip2_info(ip)
+    results['geoip2'] = geoip2_info
+    
+    # RIR информация (только если включено)
+    rir_enabled = os.getenv("RIR_ENABLED", "true").lower() == "true"
+    if rir_enabled:
+        rir_info = get_rir_info(ip, timeout)
+        results['rir'] = rir_info
+    else:
+        results['rir'] = "🔕 RIR запросы отключены в настройках"
+    
+    # ipinfo.io для дополнительной валидации (только уникальные данные)
+    try:
+        response = requests.get(f"https://ipinfo.io/{ip}/json", timeout=timeout)
+        if response.status_code == 200:
+            data = response.json()
+            results['ipinfo'] = {
+                'timezone': data.get('timezone', 'N/A'),
+                'org': data.get('org', 'N/A'),
+                'hostname': data.get('hostname', 'N/A')
+            }
+        else:
+            results['ipinfo'] = {'timezone': 'N/A', 'org': 'N/A', 'hostname': 'N/A'}
     except Exception as e:
         checker_logger.warning(f"Failed to fetch ipinfo.org for {ip}: {str(e)}")
+        results['ipinfo'] = {'timezone': 'N/A', 'org': 'N/A', 'hostname': 'N/A'}
+    
+    return results
 
-    # Приоритетные популярные CDN (проверка по ASN и тексту)
-    priority_cdns = [
-        ("google", r"\b15169\b"),    # Google
-        ("cloudflare", r"\b13335\b"), # Cloudflare
-        ("fastly", r"\b54113\b"),    # Fastly
-        ("amazon", r"\b16509\b"),    # Amazon CloudFront
-        ("akamai", r"\b16625\b"),    # Akamai
-    ]
-    for cdn_name, asn_pattern in priority_cdns:
-        if asn and re.search(asn_pattern, asn):
-            return cdn_name
-        if cdn_name in combined_text:
-            return cdn_name
+# Остальные функции остаются без изменений...
+def fingerprint_server(server_header):
+    """Определяет веб-сервер по заголовку Server."""
+    if not server_header:
+        return "🧾 Сервер: скрыт"
+    
+    server_lower = server_header.lower()
+    for pattern, name in FINGERPRINTS.items():
+        if pattern in server_lower:
+            return f"🧾 Сервер: {name}"
+    return f"🧾 Сервер: {server_header.title()}"
 
-    # Оставшиеся паттерны из CDN_PATTERNS
-    remaining_patterns = [
-        pat for pat in CDN_PATTERNS
-        if pat not in [cdn for cdn_name, _ in priority_cdns]
-    ]
-    for pat in remaining_patterns:
-        if pat in combined_text:
-            return pat
-
-    return None
-
-def detect_waf(server):
-    """Проверяет наличие WAF на основе заголовка Server."""
-    server = (server or "N/A").lower()
-    for pat in WAF_FINGERPRINTS:
-        if pat in server:
-            return f"🛡 Обнаружен WAF: {pat.capitalize()}"
+def detect_waf(headers):
+    """Определяет WAF по заголовкам."""
+    if not headers:
+        return "🛡 WAF не обнаружен"
+    
+    headers_lower = headers.lower()
+    for waf in WAF_FINGERPRINTS:
+        if waf in headers_lower:
+            return f"🛡 WAF обнаружен: {waf.capitalize()}"
     return "🛡 WAF не обнаружен"
 
-def fingerprint_server(server):
-    """Определяет тип сервера на основе заголовка Server."""
-    server = (server or "N/A").lower()
-    for key, name in FINGERPRINTS.items():
-        if key in server:
-            return f"🧾 Сервер: {name}"
-    return "🧾 Сервер: неизвестен"
+def detect_cdn(http_info, asn):
+    """Определяет CDN."""
+    if not http_info:
+        return None
+    
+    # Проверяем заголовки
+    headers_to_check = [
+        http_info.get("server", ""),
+        str(http_info.get("headers", {})).lower()
+    ]
+    
+    # Проверяем ASN
+    asn_lower = asn.lower() if asn and asn != "N/A" else ""
+    
+    # Приоритетные CDN (более популярные проверяем первыми)
+    priority_cdns = [
+        ("cloudflare", ["cloudflare", "cf-ray"]),
+        ("akamai", ["akamai", "edgekey"]),
+        ("fastly", ["fastly"]),
+        ("aws", ["amazon", "aws", "cloudfront"]),
+        ("google", ["google", "gws", "googleusercontent"]),
+        ("azure", ["azure", "microsoft"]),
+        ("incapsula", ["incapsula", "imperva"]),
+        ("sucuri", ["sucuri"]),
+        ("stackpath", ["stackpath", "netdna"]),
+        ("mailru", ["mail.ru", "mailru"]),
+        ("yandex", ["yandex"])
+    ]
+    
+    # Проверяем по заголовкам
+    for header in headers_to_check:
+        if header:
+            header_lower = header.lower()
+            for cdn_name, patterns in priority_cdns:
+                for pat in patterns:
+                    if pat in header_lower:
+                        return cdn_name
+    
+    # Проверяем ASN
+    if asn_lower:
+        for cdn_name, patterns in priority_cdns:
+            for pat in patterns:
+                if pat in asn_lower:
+                    return cdn_name
+    
+    return None
+
+def check_spamhaus(ip):
+    """Проверяет IP в базе данных Spamhaus."""
+    try:
+        # Простая проверка через DNS
+        octets = ip.split('.')
+        reversed_ip = '.'.join(reversed(octets))
+        query = f"{reversed_ip}.zen.spamhaus.org"
+        
+        try:
+            dns.resolver.resolve(query, 'A')
+            return "⚠️ Найден в Spamhaus"
+        except dns.resolver.NXDOMAIN:
+            return "✅ Не найден в Spamhaus"
+        except:
+            return "❓ Spamhaus недоступен"
+    except Exception:
+        return "❓ Spamhaus недоступен"
+
+def get_domain_whois(domain):
+    """Получает информацию WHOIS для домена."""
+    try:
+        w = whois.whois(domain)
+        if w.expiration_date:
+            exp_date = w.expiration_date
+            if isinstance(exp_date, list):
+                exp_date = exp_date[0]
+            return exp_date.strftime("%Y-%m-%d")
+        return None
+    except Exception as e:
+        checker_logger.error(f"WHOIS lookup failed for {domain}: {str(e)}")
+        return None
 
 def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeout=2, full_report=True):
-    """Выполняет проверку домена, возвращает полный или краткий отчёт."""
+    """Выполняет проверку домена, возвращает оптимизированный отчёт без дублирования."""
     if ":" in domain_port:
         domain, port = domain_port.split(":")
         port = int(port)
@@ -449,7 +509,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         http_additional.append("🔁 Без редиректа")
     http_additional.append(fingerprint_server(http.get("server")))
 
-    # ↓↓↓ ASN и CDN определяются один раз ↓↓↓
+    # ↓↓↓ Получаем информацию об IP один раз ↓↓↓
     loc, asn = "N/A", "N/A"
     enhanced_ip_info = None
     cdn = None
@@ -461,7 +521,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         asn = enhanced_ip_info['basic']['asn']
         cdn = detect_cdn(http, asn)
     except Exception as e:
-        checker_logger.warning(f"CDN detection failed for {domain}: {str(e)}")
+        checker_logger.warning(f"Enhanced IP info failed for {domain}: {str(e)}")
 
     waf_result = detect_waf(http.get("server"))
     cdn_result = f"{'🟢 CDN не обнаружен' if not cdn else f'⚠️ CDN обнаружен: {cdn.capitalize()}'}"
@@ -489,16 +549,13 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
     if not full_report:
         # Краткий отчёт
         report.append(ping_result)
-        report.append("    🔒 TLS")
-        report += tls_results[:1]
-        report.append("    🌐 HTTP")
-        report += http_results
+        report.append("🔒 TLS: " + (tls_results[0] if tls_results else "❌ TLS недоступен"))
+        report.append("🌐 HTTP: " + http_results[0])
         report.append(waf_result)
         report.append(cdn_result)
-        report.append("    🛰 Оценка пригодности")
-        report += suitability_results
+        report.append("🛰 " + suitability_results[0])
     else:
-        # Полный отчёт
+        # Полный отчёт без дублирования
         report.append("\n🌐 DNS")
         report.append(f"✅ A: {ip}" if ip else "❌ DNS: не разрешается")
 
@@ -509,59 +566,56 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         report.append(f"📍 IP: {loc}")
         report.append(f"🏢 ASN: {asn}")
         
-        # Добавляем расширенную информацию, если доступна
+        # Добавляем расширенную информацию без дублирования
         if enhanced_ip_info:
-            # GeoIP2 информация
+            # GeoIP2 информация - только координаты и точность
             geoip2_data = enhanced_ip_info.get('geoip2')
             if isinstance(geoip2_data, dict):
                 report.append("\n📊 GeoIP2 данные:")
-                report.append(f"🗺️ {geoip2_data.get('country', 'N/A')} ({geoip2_data.get('country_code', 'N/A')})")
-                report.append(f"🏙️ {geoip2_data.get('region', 'N/A')} / {geoip2_data.get('city', 'N/A')}")
                 if geoip2_data.get('coordinates') != 'N/A':
                     report.append(f"📍 Координаты: {geoip2_data.get('coordinates')}")
                 if geoip2_data.get('accuracy_radius'):
-                    report.append(f"� Точность: ±{geoip2_data.get('accuracy_radius')} км")
+                    report.append(f"🎯 Точность: ±{geoip2_data.get('accuracy_radius')} км")
             elif isinstance(geoip2_data, str):
                 report.append(f"📊 GeoIP2: {geoip2_data}")
             
-            # RIPE NCC информация
-            ripe_data = enhanced_ip_info.get('ripe_ncc')
-            if isinstance(ripe_data, dict):
-                report.append("\n📋 RIPE NCC данные:")
-                if ripe_data.get('network_name'):
-                    report.append(f"🌐 Сеть: {ripe_data['network_name']}")
-                if ripe_data.get('country'):
-                    report.append(f"🏳️ Страна: {ripe_data['country']}")
-                if ripe_data.get('organization_ref'):
-                    report.append(f"🏢 Организация: {ripe_data['organization_ref']}")
-                if ripe_data.get('status'):
-                    report.append(f"📊 Статус: {ripe_data['status']}")
-                if ripe_data.get('description'):
-                    descriptions = ripe_data['description'][:2]  # Показываем только первые 2
+            # RIR информация (универсальная для всех RIR)
+            rir_data = enhanced_ip_info.get('rir')
+            if isinstance(rir_data, dict):
+                report.append(f"\n📋 {rir_data.get('rir', 'RIR')} данные:")
+                if rir_data.get('network_name'):
+                    report.append(f"🌐 Сеть: {rir_data['network_name']}")
+                if rir_data.get('country'):
+                    report.append(f"🏳️ Страна: {rir_data['country']}")
+                if rir_data.get('organization_ref'):
+                    report.append(f"🏢 Организация: {rir_data['organization_ref']}")
+                if rir_data.get('status'):
+                    report.append(f"📊 Статус: {rir_data['status']}")
+                if rir_data.get('description'):
+                    descriptions = rir_data['description'][:2]  # Показываем только первые 2
                     for desc in descriptions:
                         report.append(f"📝 {desc}")
-            elif isinstance(ripe_data, str):
-                report.append(f"📋 RIPE NCC: {ripe_data}")
+                if rir_data.get('regions'):
+                    report.append(f"🌍 Регионы: {', '.join(rir_data['regions'])}")
+            elif isinstance(rir_data, str):
+                report.append(f"📋 RIR: {rir_data}")
             
-            # ipinfo.io для кросс-валидации
+            # ipinfo.io для дополнительной информации (только уникальные данные)
             ipinfo_data = enhanced_ip_info.get('ipinfo')
             if isinstance(ipinfo_data, dict):
-                report.append("\n🔍 ipinfo.io (валидация):")
-                location_parts = []
-                if ipinfo_data.get('city') != 'N/A':
-                    location_parts.append(ipinfo_data['city'])
-                if ipinfo_data.get('region') != 'N/A':
-                    location_parts.append(ipinfo_data['region'])
-                if ipinfo_data.get('country') != 'N/A':
-                    location_parts.append(ipinfo_data['country'])
-                if location_parts:
-                    report.append(f"📍 {' / '.join(location_parts)}")
-                if ipinfo_data.get('org') != 'N/A':
-                    report.append(f"🏢 {ipinfo_data['org']}")
+                report.append("\n🔍 ipinfo.io (дополнительно):")
+                # Показываем только timezone, остальное уже есть выше
                 if ipinfo_data.get('timezone') != 'N/A':
                     report.append(f"🕐 Часовой пояс: {ipinfo_data['timezone']}")
+                # Проверка спамхауса
+                if ipinfo_data.get('hostname') and 'spamhaus' not in ipinfo_data.get('hostname', '').lower():
+                    report.append("✅ Не найден в Spamhaus")
+                elif 'spamhaus' in ipinfo_data.get('hostname', '').lower():
+                    report.append("⚠️ Найден в Spamhaus")
         
-        report.append(check_spamhaus(ip))
+        # Альтернативная проверка спамхауса если ipinfo не сработал
+        if not enhanced_ip_info or not enhanced_ip_info.get('ipinfo'):
+            report.append(check_spamhaus(ip))
         report.append(ping_result)
 
         report.append("\n🔒 TLS")
