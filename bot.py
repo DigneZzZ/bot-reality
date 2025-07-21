@@ -231,7 +231,7 @@ async def send_topic_aware_message(message: types.Message, text: str, reply_mark
             sent_message = await message.answer(text, reply_markup=reply_markup)
         
         # Автоматически планируем удаление для групповых сообщений
-        if message.chat.type in ['group', 'supergroup'] and AUTO_DELETE_GROUP_MESSAGES:
+        if message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP] and AUTO_DELETE_GROUP_MESSAGES:
             await schedule_message_deletion(message.chat.id, sent_message.message_id)
         
         return sent_message
@@ -242,7 +242,7 @@ async def send_topic_aware_message(message: types.Message, text: str, reply_mark
         sent_message = await message.answer(text, reply_markup=reply_markup)
         
         # Автоматически планируем удаление для групповых сообщений
-        if message.chat.type in ['group', 'supergroup'] and AUTO_DELETE_GROUP_MESSAGES:
+        if message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP] and AUTO_DELETE_GROUP_MESSAGES:
             await schedule_message_deletion(message.chat.id, sent_message.message_id)
         
         return sent_message
@@ -362,33 +362,69 @@ def register_violation(user_id):
     user_violations[user_id] = record
     return int(record["until"] - time()) if record["count"] >= 5 else 0
 
-async def check_rate_limit(user_id: int) -> bool:
+async def check_rate_limit(user_id: int, is_group: bool = False) -> bool:
+    """Проверяет лимит запросов для пользователя"""
     r = await get_redis()
     try:
-        key = f"rate:{user_id}:{datetime.now().strftime('%Y%m%d%H%M')}"
-        count = await r.get(key)
-        count = int(count) if count else 0
-        if count >= 10:
-            logging.warning(f"Rate limit exceeded for user {user_id}: {count} requests")
-            return False
-        await r.incr(key)
-        await r.expire(key, 60)
-        return True
+        if is_group:
+            # Для групп: 1 запрос в 5 минут
+            key = f"group_rate:{user_id}:{datetime.now().strftime('%Y%m%d%H')}"
+            # Создаем ключ по часам, но проверяем последний запрос
+            last_request_key = f"group_last:{user_id}"
+            last_request = await r.get(last_request_key)
+            
+            if last_request:
+                last_time = float(last_request)
+                current_time = time()
+                if current_time - last_time < 300:  # 300 секунд = 5 минут
+                    remaining = 300 - (current_time - last_time)
+                    logging.warning(f"Group rate limit exceeded for user {user_id}: {remaining:.0f}s remaining")
+                    return False
+            
+            # Обновляем время последнего запроса
+            await r.set(last_request_key, time())
+            await r.expire(last_request_key, 300)  # TTL 5 минут
+            return True
+        else:
+            # Для ЛС: 10 запросов в минуту (как было)
+            key = f"rate:{user_id}:{datetime.now().strftime('%Y%m%d%H%M')}"
+            count = await r.get(key)
+            count = int(count) if count else 0
+            if count >= 10:
+                logging.warning(f"Private rate limit exceeded for user {user_id}: {count} requests")
+                return False
+            await r.incr(key)
+            await r.expire(key, 60)
+            return True
     finally:
         await r.aclose()
 
-async def check_daily_limit(user_id: int) -> bool:
+async def check_daily_limit(user_id: int, is_group: bool = False) -> bool:
+    """Проверяет дневной лимит для пользователя"""
     r = await get_redis()
     try:
-        key = f"daily:{user_id}:{datetime.now().strftime('%Y%m%d')}"
-        count = await r.get(key)
-        count = int(count) if count else 0
-        if count >= 100:
-            logging.warning(f"Daily limit exceeded for user {user_id}: {count} requests")
-            return False
-        await r.incr(key)
-        await r.expire(key, 86400)
-        return True
+        if is_group:
+            # Для групп: 50 запросов в день
+            key = f"group_daily:{user_id}:{datetime.now().strftime('%Y%m%d')}"
+            count = await r.get(key)
+            count = int(count) if count else 0
+            if count >= 50:
+                logging.warning(f"Group daily limit exceeded for user {user_id}: {count} requests")
+                return False
+            await r.incr(key)
+            await r.expire(key, 86400)
+            return True
+        else:
+            # Для ЛС: 100 запросов в день (как было)
+            key = f"daily:{user_id}:{datetime.now().strftime('%Y%m%d')}"
+            count = await r.get(key)
+            count = int(count) if count else 0
+            if count >= 100:
+                logging.warning(f"Private daily limit exceeded for user {user_id}: {count} requests")
+                return False
+            await r.incr(key)
+            await r.expire(key, 86400)
+            return True
     finally:
         await r.aclose()
 
@@ -663,11 +699,11 @@ async def handle_deep_link_full_report(message: types.Message, domain: str):
     user_id = message.from_user.id
     
     # Проверяем лимиты
-    if not await check_rate_limit(user_id):
+    if not await check_rate_limit(user_id, is_group=False):
         await message.answer("🚫 Слишком много запросов. Не более 10 в минуту.")
         return
         
-    if not await check_daily_limit(user_id):
+    if not await check_daily_limit(user_id, is_group=False):
         await message.answer("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
         return
     
@@ -1048,12 +1084,19 @@ async def cmd_check(message: types.Message):
         await send_topic_aware_message(message, response)
         return
         
-    if not await check_rate_limit(user_id):
-        await send_topic_aware_message(message, "🚫 Слишком много запросов. Не более 10 в минуту.")
+    is_group = is_group_chat(message)
+    if not await check_rate_limit(user_id, is_group=is_group):
+        if is_group:
+            await send_topic_aware_message(message, "🚫 Слишком много запросов в группе. Не более 1 запроса в 5 минут.")
+        else:
+            await send_topic_aware_message(message, "🚫 Слишком много запросов. Не более 10 в минуту.")
         return
         
-    if not await check_daily_limit(user_id):
-        await send_topic_aware_message(message, "🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+    if not await check_daily_limit(user_id, is_group=is_group):
+        if is_group:
+            await send_topic_aware_message(message, "🚫 Достигнут дневной лимит в группах (50 проверок). Попробуйте завтра.")
+        else:
+            await send_topic_aware_message(message, "🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
         return
         
     await log_analytics("command_used", user_id, details=f"{command} {args}")
@@ -1077,12 +1120,19 @@ async def handle_domain(message: types.Message):
     if not text or text.startswith("/"):
         return
         
-    if not await check_rate_limit(user_id):
-        await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
+    is_group = is_group_chat(message)
+    if not await check_rate_limit(user_id, is_group=is_group):
+        if is_group:
+            await message.reply("🚫 Слишком много запросов в группе. Не более 1 запроса в 5 минут.")
+        else:
+            await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
         return
         
-    if not await check_daily_limit(user_id):
-        await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+    if not await check_daily_limit(user_id, is_group=is_group):
+        if is_group:
+            await message.reply("🚫 Достигнут дневной лимит в группах (50 проверок). Попробуйте завтра.")
+        else:
+            await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
         return
         
     await log_analytics("domain_message", user_id, details=text)
@@ -1127,12 +1177,12 @@ async def handle_group_commands(message: types.Message):
         )
         return
         
-    if not await check_rate_limit(user_id):
-        await send_topic_aware_message(message, "🚫 Слишком много запросов. Не более 10 в минуту.")
+    if not await check_rate_limit(user_id, is_group=True):
+        await send_topic_aware_message(message, "🚫 Слишком много запросов в группе. Не более 1 запроса в 5 минут.")
         return
         
-    if not await check_daily_limit(user_id):
-        await send_topic_aware_message(message, "🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+    if not await check_daily_limit(user_id, is_group=True):
+        await send_topic_aware_message(message, "🚫 Достигнут дневной лимит в группах (50 проверок). Попробуйте завтра.")
         return
     
     await log_analytics("group_command_used", user_id, details=f"{command_without_prefix}")
@@ -1313,12 +1363,12 @@ async def process_callback(callback_query: types.CallbackQuery):
                 await callback_query.answer("❌ Этот отчёт предназначен не для вас", show_alert=True)
                 return
             
-            # Проверяем лимиты
-            if not await check_rate_limit(user_id):
-                await callback_query.answer("🚫 Слишком много запросов. Не более 10 в минуту.", show_alert=True)
+            # Проверяем лимиты (это callback из группы, используем групповые лимиты)
+            if not await check_rate_limit(user_id, is_group=True):
+                await callback_query.answer("🚫 Слишком много запросов в группе. Не более 1 запроса в 5 минут.", show_alert=True)
                 return
-            if not await check_daily_limit(user_id):
-                await callback_query.answer("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.", show_alert=True)
+            if not await check_daily_limit(user_id, is_group=True):
+                await callback_query.answer("🚫 Достигнут дневной лимит в группах (50 проверок). Попробуйте завтра.", show_alert=True)
                 return
             
             r = await get_redis()
@@ -1374,6 +1424,21 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
         await message.reply("❌ Не удалось извлечь домены. Укажите валидные домены, например: example.com")
         return
 
+    # Проверяем, групповой ли это чат
+    is_group = is_group_chat(message)
+    
+    # В групповых чатах разрешаем только 1 домен
+    if is_group and len(domains) > 1:
+        await send_topic_aware_message(message,
+            f"⚠️ <b>В групповых чатах можно проверить только 1 домен за раз</b>\n\n"
+            f"📝 Вы указали {len(domains)} доменов: {', '.join(domains[:3])}{'...' if len(domains) > 3 else ''}\n\n"
+            f"💡 Используйте первый домен: <code>{domains[0]}</code>\n"
+            f"🔄 Для остальных отправьте отдельные запросы\n\n"
+            f"📊 <b>Лимиты в группах:</b> 1 запрос в 5 минут, до 50 в день"
+        )
+        # Берем только первый домен
+        domains = domains[:1]
+
     r = await get_redis()
     try:
         valid_domains = []
@@ -1399,9 +1464,6 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
             else:
                 await send_topic_aware_message(message, "❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
             return
-
-        # Для массовых запросов (более 1 домена) в группах - просто ставим в очередь, НЕ отправляем уведомления
-        if len(valid_domains) > 1 and is_group_chat(message):
             # Просто ставим в очередь без всяких сообщений
             for domain in valid_domains:
                 chat_id = message.chat.id
