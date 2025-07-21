@@ -586,6 +586,118 @@ async def cq_admin_panel(call: CallbackQuery):
     await call.message.edit_text("Панель администратора:", reply_markup=get_admin_keyboard())
     await call.answer()
 
+@router.callback_query(F.data == "reset_queue")
+async def cq_reset_queue(call: CallbackQuery):
+    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
+    r = await get_redis_connection()
+    try:
+        q_len = await r.llen("queue:domains")
+        p_keys = await r.keys("pending:*")
+        if q_len > 0: await r.delete("queue:domains")
+        if p_keys: await r.delete(*p_keys)
+        await call.message.edit_text(f"✅ Очередь сброшена. Удалено задач: {q_len}, ключей pending: {len(p_keys)}.", reply_markup=get_admin_keyboard())
+    finally:
+        await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data == "clearcache")
+async def cq_clearcache(call: CallbackQuery):
+    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
+    r = await get_redis_connection()
+    try:
+        keys = await r.keys("result:*")
+        if keys:
+            await r.delete(*keys)
+            await call.message.edit_text(f"✅ Кэш очищен. Удалено {len(keys)} записей.", reply_markup=get_admin_keyboard())
+        else:
+            await call.message.edit_text("✅ Кэш уже пуст.", reply_markup=get_admin_keyboard())
+    finally:
+        await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data == "approved")
+async def cq_approved(call: CallbackQuery):
+    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
+    if not SAVE_APPROVED_DOMAINS:
+        await call.message.edit_text("⛔ Функция сохранения доменов отключена.", reply_markup=get_admin_keyboard())
+        await call.answer()
+        return
+    r = await get_redis_connection()
+    try:
+        domains = await r.smembers("approved_domains")
+        if not domains:
+            await call.message.edit_text("📜 Список пригодных доменов пуст.", reply_markup=get_admin_keyboard())
+        else:
+            response = "📜 <b>Пригодные домены:</b>\n" + "\n".join(f"{i}. {d}" for i, d in enumerate(sorted(domains), 1))
+            await call.message.edit_text(response, reply_markup=get_admin_keyboard())
+    finally:
+        await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data == "clear_approved")
+async def cq_clear_approved(call: CallbackQuery):
+    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
+    if not SAVE_APPROVED_DOMAINS:
+        await call.answer("⛔ Функция сохранения доменов отключена.", show_alert=True)
+        return
+    r = await get_redis_connection()
+    try:
+        await r.delete("approved_domains")
+        await call.message.edit_text("✅ Список пригодных доменов очищен.", reply_markup=get_admin_keyboard())
+    finally:
+        await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data == "export_approved")
+async def cq_export_approved(call: CallbackQuery):
+    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
+    if not SAVE_APPROVED_DOMAINS:
+        await call.answer("⛔ Функция сохранения доменов отключена.", show_alert=True)
+        return
+    r = await get_redis_connection()
+    try:
+        domains = await r.smembers("approved_domains")
+        if not domains:
+            await call.message.edit_text("📜 Список пуст.", reply_markup=get_admin_keyboard())
+        else:
+            file_path = os.path.join(os.getenv("LOG_DIR", "/tmp"), "approved_domains.txt")
+            with open(file_path, "w") as f:
+                f.write("\n".join(sorted(domains)))
+            await call.message.reply_document(FSInputFile(file_path))
+            await call.message.edit_text("✅ Файл с пригодными доменами отправлен.", reply_markup=get_admin_keyboard())
+    except Exception as e:
+        await call.message.edit_text(f"❌ Ошибка экспорта: {e}", reply_markup=get_admin_keyboard())
+    finally:
+        await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data == "analytics")
+async def cq_analytics(call: CallbackQuery):
+    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
+    if not analytics_collector:
+        await call.message.edit_text("❌ Аналитика не инициализирована.", reply_markup=get_admin_keyboard())
+        await call.answer()
+        return
+    try:
+        report = await analytics_collector.generate_analytics_report(call.from_user.id)
+        await call.message.edit_text(report, reply_markup=get_admin_keyboard())
+    except Exception as e:
+        await call.message.edit_text(f"❌ Ошибка генерации отчета: {e}", reply_markup=get_admin_keyboard())
+    await call.answer()
+
+@router.callback_query(F.data == "groups")
+async def cq_groups(call: CallbackQuery):
+    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
+    
+    if not AUTHORIZED_GROUPS:
+        status = "🌐 <b>Режим авторизации:</b> Открытый (любые группы)\n"
+    else:
+        status = f"🔒 <b>Режим авторизации:</b> Ограниченный ({len(AUTHORIZED_GROUPS)} групп)\n"
+        status += "<b>Авторизованные группы:</b>\n" + "\n".join(f"• <code>{gid}</code>" for gid in sorted(AUTHORIZED_GROUPS))
+    
+    await call.message.edit_text(status, reply_markup=get_admin_keyboard())
+    await call.answer()
+
 # --- Group Management ---
 @router.my_chat_member(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def on_group_join(update: types.ChatMemberUpdated):
