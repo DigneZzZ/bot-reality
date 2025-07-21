@@ -449,6 +449,7 @@ async def cmd_start(message: types.Message):
             domain = extract_domain(decoded_param)
             if domain:
                 await message.answer(f"🔍 <b>Проверяю {domain}...</b>")
+                # Вызываем handle_domain_logic с корректными параметрами
                 await handle_domain_logic(message, domain, short_mode=True)
                 return
             else:
