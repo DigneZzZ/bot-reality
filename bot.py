@@ -454,6 +454,9 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
     
+    # Логируем вызов команды /start
+    logging.warning(f"Command /start called by user {user_id}, message text: '{message.text}'")
+    
     # Проверяем простые параметры после /start
     if message.text and len(message.text.split()) > 1:
         param = message.text.split()[1]
@@ -470,7 +473,7 @@ async def cmd_start(message: types.Message):
             domain_part = decoded_param[5:]  # Убираем "full_"
             domain = extract_domain(domain_part)
             if domain:
-                logging.info(f"Deep link full report activated for domain {domain} by user {user_id}")
+                logging.warning(f"Deep link full report activated for domain {domain} by user {user_id}")
                 await message.answer(f"📄 <b>Получаю полный отчет для {domain}...</b>")
                 # Вызываем handle_domain_logic с full режимом
                 await handle_domain_logic(message, domain, short_mode=False)
@@ -485,7 +488,7 @@ async def cmd_start(message: types.Message):
             # Это похоже на домен - просто запускаем проверку в ЛС
             domain = extract_domain(decoded_param)
             if domain:
-                logging.info(f"Deep link activated for domain {domain} by user {user_id}")
+                logging.warning(f"Deep link activated for domain {domain} by user {user_id}")
                 await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
                 # Вызываем handle_domain_logic с корректными параметрами
                 await handle_domain_logic(message, domain, short_mode=True)
@@ -500,7 +503,7 @@ async def cmd_start(message: types.Message):
             # Пробуем извлечь домен даже из коротких параметров
             domain = extract_domain(decoded_param)
             if domain:
-                logging.info(f"Deep link activated for short domain {domain} by user {user_id}")
+                logging.warning(f"Deep link activated for short domain {domain} by user {user_id}")
                 await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
                 await handle_domain_logic(message, domain, short_mode=True)
                 return
