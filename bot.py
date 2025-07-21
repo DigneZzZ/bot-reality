@@ -397,30 +397,21 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
     
-    # Проверяем deep link параметры
+    # Проверяем простые параметры после /start
     if message.text and len(message.text.split()) > 1:
         param = message.text.split()[1]
-        if param.startswith("full_"):
-            domain = param[5:]  # Убираем "full_" префикс
-            # Обрабатываем запрос полного отчёта
-            await handle_deep_link_full_report(message, domain)
-            return
-        elif param.startswith("result_"):
-            # result_domain - запрос результата конкретного домена (доступно всем)
-            domain = param[7:]  # Убираем "result_" префикс
-            await handle_deep_link_single_result(message, domain)
-            return
-        elif param.startswith("results_all_"):
-            # results_all_userid - запрос всех результатов пользователя
-            try:
-                target_user_id = int(param[12:])  # Убираем "results_all_" префикс
-                if user_id == target_user_id:
-                    await handle_deep_link_all_results(message, user_id)
-                else:
-                    await message.answer("❌ Эти результаты предназначены не для вас.")
-            except ValueError:
-                await message.answer("❌ Неверный формат ссылки.")
-            return
+        
+        # Простая проверка - если это выглядит как домен, проверяем его
+        if "." in param and len(param) > 3:
+            # Это похоже на домен - просто запускаем проверку в ЛС
+            domain = extract_domain(param)
+            if domain:
+                await message.answer(f"🔍 <b>Проверяю {domain}...</b>")
+                await handle_domain_logic(message, domain, short_mode=True)
+                return
+            else:
+                await message.answer(f"❌ Некорректный домен: {param}")
+                return
     
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для Reality.\n\n"
@@ -503,8 +494,8 @@ async def handle_bulk_domains_in_group(message: types.Message, domains: list, us
             batch = domains[i:i+3]
             row = []
             for domain in batch:
-                # Создаем deep link для получения результата в ЛС
-                deep_link = f"https://t.me/{bot_username}?start=result_{domain}"
+                # Простой диплинк - /start domain (перезапуск проверки в ЛС)
+                deep_link = f"https://t.me/{bot_username}?start={domain}"
                 row.append(InlineKeyboardButton(
                     text=f"📄 {domain}", 
                     url=deep_link
@@ -1403,9 +1394,9 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                 await send_topic_aware_message(message, "❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
             return
 
-        # Для массовых запросов (более 1 домена) в группах - НЕ отправляем сообщения в группу
+        # Для массовых запросов (более 1 домена) в группах - просто ставим в очередь, НЕ отправляем уведомления
         if len(valid_domains) > 1 and is_group_chat(message):
-            # Просто ставим в очередь без ответа в группе
+            # Просто ставим в очередь без всяких сообщений
             for domain in valid_domains:
                 chat_id = message.chat.id
                 message_id = message.message_id
@@ -1414,42 +1405,35 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                 await enqueue(domain, user_id, short_mode=short_mode,
                              chat_id=chat_id, message_id=message_id, thread_id=thread_id)
             
-            # Отправляем уведомление только в ЛС пользователю
+            # Отправляем ТОЛЬКО короткое сообщение в группу с кнопками для получения результатов в ЛС
             try:
                 bot_info = await bot.get_me()
                 bot_username = bot_info.username
                 
-                # Создаем кнопки для получения результатов
+                # Создаем простые кнопки - каждая просто запускает /start domain.com в ЛС
                 buttons = []
                 for i in range(0, len(valid_domains), 3):
                     batch = valid_domains[i:i+3]
                     row = []
                     for domain in batch:
-                        deep_link = f"https://t.me/{bot_username}?start=result_{domain}"
+                        # Простой диплинк - /start domain.com (перезапуск проверки в ЛС)
+                        deep_link = f"https://t.me/{bot_username}?start={domain}"
                         row.append(InlineKeyboardButton(text=f"📄 {domain}", url=deep_link))
                     buttons.append(row)
                 
-                # Убираем кнопку "Все результаты" так как она персональная
-                
                 keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
                 
-                # Отправляем уведомление в ЛС
-                private_message = (
+                # Короткое сообщение в группе
+                group_message = (
                     f"🔍 <b>Массовая проверка {len(valid_domains)} доменов</b>\n\n"
-                    f"📊 Ваш запрос из группы обрабатывается.\n"
-                    f"Результаты будут готовы через несколько секунд.\n\n"
-                    f"📄 <b>Получить результаты:</b>"
+                    f"� <b>Получить результаты:</b>\n"
+                    f"Нажмите на кнопки ниже для перехода в ЛС с ботом"
                 )
                 
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=private_message,
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
-                )
+                await send_topic_aware_message(message, group_message, reply_markup=keyboard)
                 
             except Exception as e:
-                logging.error(f"Failed to send private notification for bulk request: {e}")
+                logging.error(f"Failed to send group notification for bulk request: {e}")
             
             return
         
