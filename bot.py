@@ -306,7 +306,9 @@ def get_full_report_button(domain: str):
 def get_group_full_report_button(domain: str, user_id: int):
     """Создаёт кнопку с deep link для получения полного отчёта в ЛС из группового чата"""
     bot_username = os.getenv("BOT_USERNAME", "bot")  # Замените на актуальное имя бота
-    deep_link = f"https://t.me/{bot_username}?start=full_{domain}"
+    # Кодируем домен для URL
+    encoded_domain = quote(domain, safe='')
+    deep_link = f"https://t.me/{bot_username}?start=full_{encoded_domain}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", url=deep_link)]
     ])
@@ -462,8 +464,24 @@ async def cmd_start(message: types.Message):
         except:
             decoded_param = param  # Fallback если декодирование не удалось
         
-        # Простая проверка - если это выглядит как домен, проверяем его
-        if "." in decoded_param and len(decoded_param) > 3:
+        # Проверяем специальные deep link команды
+        if decoded_param.startswith("full_"):
+            # Это запрос полного отчета: /start full_domain.com
+            domain_part = decoded_param[5:]  # Убираем "full_"
+            domain = extract_domain(domain_part)
+            if domain:
+                logging.info(f"Deep link full report activated for domain {domain} by user {user_id}")
+                await message.answer(f"📄 <b>Получаю полный отчет для {domain}...</b>")
+                # Вызываем handle_domain_logic с full режимом
+                await handle_domain_logic(message, domain, short_mode=False)
+                return
+            else:
+                logging.warning(f"Failed to extract domain from full deep link param: {domain_part}")
+                await message.answer(f"❌ Некорректный домен в полном отчете: {domain_part}")
+                return
+        
+        # Простая проверка - если это выглядит как домен, проверяем его (краткий отчет)
+        elif "." in decoded_param and len(decoded_param) > 3:
             # Это похоже на домен - просто запускаем проверку в ЛС
             domain = extract_domain(decoded_param)
             if domain:
@@ -475,6 +493,16 @@ async def cmd_start(message: types.Message):
             else:
                 logging.warning(f"Failed to extract domain from deep link param: {decoded_param}")
                 await message.answer(f"❌ Некорректный домен: {decoded_param}")
+                return
+        
+        # Проверяем, может быть это просто домен без точки или короткий (например, через редирект)
+        else:
+            # Пробуем извлечь домен даже из коротких параметров
+            domain = extract_domain(decoded_param)
+            if domain:
+                logging.info(f"Deep link activated for short domain {domain} by user {user_id}")
+                await message.answer(f"🔍 <b>Получаю результат для {domain}...</b>")
+                await handle_domain_logic(message, domain, short_mode=True)
                 return
     
     welcome_message = (
