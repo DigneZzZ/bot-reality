@@ -9,8 +9,24 @@ from datetime import datetime
 import logging
 import dns.resolver
 import re
+from logging.handlers import RotatingFileHandler
+import os
 
-logging.basicConfig(level=logging.INFO, filename="checker.log", format="%(asctime)s - %(levelname)s - %(message)s")
+# Настройка логирования с ротацией
+log_dir = "/app"
+log_file = os.path.join(log_dir, "checker.log")
+os.makedirs(log_dir, exist_ok=True)
+
+# Создаем логгер для checker
+checker_logger = logging.getLogger("checker")
+checker_logger.setLevel(checker_logger.WARNING)  # Только WARNING и ERROR
+
+# Проверяем, есть ли уже обработчики (чтобы избежать дубликатов)
+if not checker_logger.handlers:
+    handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2)
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    checker_logger.addHandler(handler)
 
 CDN_PATTERNS = [
     "cloudflare", "akamai", "fastly", "incapsula", "imperva", "sucuri", "stackpath",
@@ -37,7 +53,7 @@ def resolve_dns(domain):
     try:
         return socket.gethostbyname(domain)
     except Exception as e:
-        logging.error(f"DNS resolution failed for {domain}: {str(e)}")
+        checker_logger.error(f"DNS resolution failed for {domain}: {str(e)}")
         return None
 
 def get_ping(ip, timeout=1):
@@ -48,7 +64,7 @@ def get_ping(ip, timeout=1):
             return float(result)
         return None
     except Exception as e:
-        logging.error(f"Ping failed for {ip}: {str(e)}")
+        checker_logger.error(f"Ping failed for {ip}: {str(e)}")
         return None
 
 def get_tls_info(domain, port, timeout=10):
@@ -57,7 +73,6 @@ def get_tls_info(domain, port, timeout=10):
     try:
         # Разрешаем IP домена
         ip = socket.gethostbyname(domain)
-        logging.info(f"Resolved {domain} to IP: {ip}")
         
         # Создаем контекст TLS с минимальной версией TLSv1.3
         ctx = ssl.create_default_context()
@@ -69,17 +84,15 @@ def get_tls_info(domain, port, timeout=10):
             raw_socket.settimeout(timeout)
             # Оборачиваем сокет в TLS с указанием SNI
             with ctx.wrap_socket(raw_socket, server_hostname=domain) as s:
-                logging.info(f"Attempting TLS connection to {ip}:{port} with SNI={domain}")
                 s.connect((ip, port))  # Подключаемся напрямую к IP
                 info["tls"] = s.version()
                 info["cipher"] = s.cipher()[0] if s.cipher() else None
                 cert = s.getpeercert()
                 expire = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
                 info["expires_days"] = (expire - datetime.utcnow()).days
-                logging.info(f"TLS connection successful: {info['tls']}, cipher: {info['cipher']}")
     except Exception as e:
         info["error"] = str(e)
-        logging.error(f"TLS check failed for {domain}:{port}: {str(e)}")
+        checker_logger.error(f"TLS check failed for {domain}:{port}: {str(e)}")
     return info
     
 def get_http_info(domain, timeout=20.0):
@@ -99,13 +112,13 @@ def get_http_info(domain, timeout=20.0):
             if resp.history:
                 info["redirect"] = str(resp.url)
             info["headers"] = dict(resp.headers)
-            logging.info(f"HTTP headers for {domain}: {info['headers']}")
+            # Убираем детальное логирование заголовков
     except ImportError as e:
         info["error"] = "HTTP/2 support requires 'h2' package. Install httpx with `pip install httpx[http2]`."
-        logging.error(f"HTTP check failed for {domain}: {str(e)}")
+        checker_logger.error(f"HTTP check failed for {domain}: {str(e)}")
     except Exception as e:
         info["error"] = str(e)
-        logging.error(f"HTTP check failed for {domain}: {str(e)}")
+        checker_logger.error(f"HTTP check failed for {domain}: {str(e)}")
     return info
 
 def get_domain_whois(domain):
@@ -119,7 +132,7 @@ def get_domain_whois(domain):
             return exp.isoformat()
         return None
     except Exception as e:
-        logging.error(f"WHOIS check failed for {domain}: {str(e)}")
+        checker_logger.error(f"WHOIS check failed for {domain}: {str(e)}")
         return None
 
 def get_ip_info(ip, timeout=5):
@@ -130,7 +143,7 @@ def get_ip_info(ip, timeout=5):
         asn = r.get("as", "N/A")
         return loc, asn
     except Exception as e:
-        logging.error(f"IP info check failed for {ip}: {str(e)}")
+        checker_logger.error(f"IP info check failed for {ip}: {str(e)}")
         return "N/A", "N/A"
 
 def scan_ports(ip, ports=[80, 443, 8080, 8443], timeout=1):
@@ -153,15 +166,15 @@ def check_spamhaus(ip):
         for rdata in answers:
             result = str(rdata)
             if result.startswith("127.0.0.") and 2 <= int(result.split(".")[-1]) <= 11:
-                logging.info(f"Spamhaus check for {ip}: listed with code {result}")
+                checker_logger.info(f"Spamhaus check for {ip}: listed with code {result}")
                 return f"⚠️ В списке Spamhaus (код: {result})"
-        logging.info(f"Spamhaus check for {ip}: not listed")
+        checker_logger.info(f"Spamhaus check for {ip}: not listed")
         return "✅ Не найден в Spamhaus"
     except dns.resolver.NXDOMAIN:
-        logging.info(f"Spamhaus check for {ip}: not listed")
+        checker_logger.info(f"Spamhaus check for {ip}: not listed")
         return "✅ Не найден в Spamhaus"
     except Exception as e:
-        logging.error(f"Spamhaus check failed for {ip}: {str(e)}")
+        checker_logger.error(f"Spamhaus check failed for {ip}: {str(e)}")
         return f"❌ Spamhaus: ошибка ({str(e)})"
 
 def detect_cdn(http_info, asn):
@@ -182,7 +195,7 @@ def detect_cdn(http_info, asn):
         ipinfo_org = requests.get(f"https://ipinfo.io/{ip}/org", timeout=5).text.lower()
         combined_text += " " + ipinfo_org
     except Exception as e:
-        logging.warning(f"Failed to fetch ipinfo.org for {ip}: {str(e)}")
+        checker_logger.warning(f"Failed to fetch ipinfo.org for {ip}: {str(e)}")
 
     # Приоритетные популярные CDN (проверка по ASN и тексту)
     priority_cdns = [
@@ -283,7 +296,7 @@ def run_check(domain_port: str, ping_threshold=50, http_timeout=20.0, port_timeo
         loc, asn = get_ip_info(ip)
         cdn = detect_cdn(http, asn)
     except Exception as e:
-        logging.warning(f"CDN detection failed for {domain}: {str(e)}")
+        checker_logger.warning(f"CDN detection failed for {domain}: {str(e)}")
 
     waf_result = detect_waf(http.get("server"))
     cdn_result = f"{'🟢 CDN не обнаружен' if not cdn else f'⚠️ CDN обнаружен: {cdn.capitalize()}'}"

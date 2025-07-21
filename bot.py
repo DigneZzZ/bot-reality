@@ -2,6 +2,7 @@ import asyncio
 from aiogram import Bot, Router, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.enums import ChatType
 import os
 import redis.asyncio as redis
 from redis_queue import enqueue, get_redis
@@ -13,6 +14,25 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
+# Импортируем новые модули (если доступны)
+try:
+    from retry_logic import retry_with_backoff, DOMAIN_CHECK_RETRY, REDIS_RETRY, TELEGRAM_RETRY
+    RETRY_AVAILABLE = True
+except ImportError:
+    RETRY_AVAILABLE = False
+    
+try:
+    from progress_tracker import BatchProcessor
+    PROGRESS_AVAILABLE = True
+except ImportError:
+    PROGRESS_AVAILABLE = False
+    
+try:
+    from analytics import AnalyticsCollector
+    ANALYTICS_AVAILABLE = True
+except ImportError:
+    ANALYTICS_AVAILABLE = False
+
 # Настройка логирования
 log_dir = "/app"
 log_file = os.path.join(log_dir, "bot.log")
@@ -23,27 +43,192 @@ log_handlers = []
 try:
     with open(log_file, "a") as f:
         f.write("")
-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+    # Уменьшаем размер файла логов и количество бэкапов
+    file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2)
     log_handlers.append(file_handler)
 except Exception as e:
     logging.warning(f"Failed to initialize logging to {log_file}: {str(e)}. Falling back to {fallback_log_file}")
     os.makedirs("/tmp", exist_ok=True)
-    file_handler = RotatingFileHandler(fallback_log_file, maxBytes=10*1024*1024, backupCount=5)
+    # Для fallback файла тоже уменьшаем размеры
+    file_handler = RotatingFileHandler(fallback_log_file, maxBytes=5*1024*1024, backupCount=2)
     log_handlers.append(file_handler)
 
 log_handlers.append(logging.StreamHandler())
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # Изменено с INFO на WARNING
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=log_handlers
 )
-logging.info("Logging initialized")
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+SAVE_APPROVED_DOMAINS = os.getenv("SAVE_APPROVED_DOMAINS", "false").lower() == "true"
+# Новые настройки для групп
+GROUP_MODE_ENABLED = os.getenv("GROUP_MODE_ENABLED", "true").lower() == "true"
+GROUP_COMMAND_PREFIX = os.getenv("GROUP_COMMAND_PREFIX", "!")  # Префикс для команд в группах
+# Авторизация групп
+AUTHORIZED_GROUPS_STR = os.getenv("AUTHORIZED_GROUPS", "").strip()
+AUTHORIZED_GROUPS = set()
+if AUTHORIZED_GROUPS_STR:
+    try:
+        AUTHORIZED_GROUPS = set(int(group_id.strip()) for group_id in AUTHORIZED_GROUPS_STR.split(",") if group_id.strip())
+    except ValueError:
+        logging.error("Invalid AUTHORIZED_GROUPS format. Should be comma-separated integers.")
+AUTO_LEAVE_UNAUTHORIZED = os.getenv("AUTO_LEAVE_UNAUTHORIZED", "false").lower() == "true"
+
 bot = Bot(token=TOKEN, parse_mode="HTML")
 router = Router()
+
+# Инициализация аналитики (если доступна)
+analytics_collector = None
+
+async def init_analytics():
+    """Инициализирует аналитику"""
+    global analytics_collector
+    if ANALYTICS_AVAILABLE:
+        try:
+            redis_client = await get_redis()
+            analytics_collector = AnalyticsCollector(redis_client)
+            logging.info("Analytics initialized successfully")
+        except Exception as e:
+            logging.warning(f"Failed to initialize analytics: {e}")
+
+def is_group_chat(message: types.Message) -> bool:
+    """Проверяет, является ли чат групповым"""
+    return message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+
+def is_authorized_group(chat_id: int) -> bool:
+    """Проверяет, авторизована ли группа"""
+    # Если список авторизованных групп пуст, разрешаем все группы
+    if not AUTHORIZED_GROUPS:
+        return True
+    
+    # Проверяем, есть ли группа в списке авторизованных
+    return chat_id in AUTHORIZED_GROUPS
+
+async def handle_unauthorized_group(message: types.Message) -> bool:
+    """Обрабатывает неавторизованную группу. Возвращает True если нужно остановить обработку"""
+    chat_id = message.chat.id
+    
+    if not is_authorized_group(chat_id):
+        # Логируем попытку использования в неавторизованной группе
+        logging.warning(f"Unauthorized group access attempt: {chat_id} ({message.chat.title})")
+        
+        if AUTO_LEAVE_UNAUTHORIZED:
+            try:
+                # Отправляем предупреждение перед выходом
+                await message.answer(
+                    "⚠️ <b>Бот не авторизован для работы в этой группе</b>\n\n"
+                    "Если вы администратор бота, добавьте ID группы в переменную AUTHORIZED_GROUPS.\n"
+                    f"ID этой группы: <code>{chat_id}</code>\n\n"
+                    "Бот покинет группу через 10 секунд."
+                )
+                
+                # Ждем 10 секунд и покидаем группу
+                await asyncio.sleep(10)
+                await bot.leave_chat(chat_id)
+                logging.info(f"Left unauthorized group: {chat_id}")
+                
+            except Exception as e:
+                logging.error(f"Failed to leave unauthorized group {chat_id}: {e}")
+        else:
+            # Просто игнорируем сообщения в неавторизованных группах
+            await message.answer(
+                "⚠️ <b>Бот не авторизован для работы в этой группе</b>\n\n"
+                f"ID группы: <code>{chat_id}</code>\n"
+                "Обратитесь к администратору бота для авторизации."
+            )
+        
+        return True  # Останавливаем дальнейшую обработку
+    
+    return False  # Группа авторизована, продолжаем обработку
+
+async def should_respond_in_group(message: types.Message) -> bool:
+    """Определяет, должен ли бот отвечать в группе"""
+    if not GROUP_MODE_ENABLED:
+        return False
+    
+    # Проверяем авторизацию группы
+    if not is_authorized_group(message.chat.id):
+        await handle_unauthorized_group(message)
+        return False
+    
+    # В группах отвечаем только на:
+    # 1. Команды с префиксом (!check, !full)
+    # 2. Упоминания бота (@botname)
+    # 3. Ответы на сообщения бота
+    
+    text = message.text or ""
+    
+    # Команды с префиксом
+    if text.startswith(GROUP_COMMAND_PREFIX):
+        return True
+    
+    # Упоминание бота
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "mention":
+                mention = text[entity.offset:entity.offset + entity.length]
+                bot_info = await bot.get_me()
+                if bot_info.username and mention.lower().replace("@", "") == bot_info.username.lower():
+                    return True
+    
+    # Ответ на сообщение бота
+    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == (await bot.get_me()).id:
+        return True
+        
+    return False
+
+def get_topic_thread_id(message: types.Message) -> int | None:
+    """Получает ID темы (топика) из сообщения"""
+    # Если это супергруппа с темами
+    if message.chat.type == ChatType.SUPERGROUP and hasattr(message, 'message_thread_id'):
+        return message.message_thread_id
+    return None
+
+async def send_topic_aware_message(message: types.Message, text: str, reply_markup=None) -> types.Message:
+    """Отправляет сообщение с учетом темы (топика)"""
+    thread_id = get_topic_thread_id(message)
+    
+    try:
+        if thread_id:
+            # Отправляем в определенную тему
+            return await bot.send_message(
+                chat_id=message.chat.id,
+                text=text,
+                message_thread_id=thread_id,
+                reply_markup=reply_markup,
+                parse_mode="HTML"
+            )
+        else:
+            # Обычная отправка (или группа без тем)
+            return await message.answer(text, reply_markup=reply_markup)
+    except Exception as e:
+        # Fallback: пробуем отправить обычным способом
+        logging.warning(f"Failed to send topic-aware message: {e}, falling back to regular message")
+        return await message.answer(text, reply_markup=reply_markup)
+
+async def log_analytics(action: str, user_id: int, **kwargs):
+    """Логирует событие в аналитику"""
+    if analytics_collector:
+        try:
+            if action == "domain_check":
+                await analytics_collector.log_domain_check(
+                    user_id=user_id,
+                    domain=kwargs.get("domain", ""),
+                    check_type=kwargs.get("check_type", "short"),
+                    result_status=kwargs.get("result_status", "unknown"),
+                    execution_time=kwargs.get("execution_time")
+                )
+            else:
+                await analytics_collector.log_user_activity(
+                    user_id=user_id,
+                    action=action,
+                    details=kwargs.get("details")
+                )
+        except Exception as e:
+            logging.warning(f"Failed to log analytics: {e}")
 
 def get_main_keyboard(is_admin: bool):
     buttons = [
@@ -51,13 +236,18 @@ def get_main_keyboard(is_admin: bool):
         [InlineKeyboardButton(text="История запросов", callback_data="history")]
     ]
     if is_admin:
-        buttons.extend([
-            [InlineKeyboardButton(text="Список пригодных доменов", callback_data="approved")],
-            [InlineKeyboardButton(text="Очистить список доменов", callback_data="clear_approved")],
-            [InlineKeyboardButton(text="Экспортировать домены", callback_data="export_approved")],
+        admin_buttons = [
             [InlineKeyboardButton(text="Сбросить очередь", callback_data="reset_queue")],
             [InlineKeyboardButton(text="Очистить кэш результатов", callback_data="clearcache")]
-        ])
+        ]
+        # Добавляем кнопки управления доменами только если включена опция
+        if SAVE_APPROVED_DOMAINS:
+            admin_buttons.extend([
+                [InlineKeyboardButton(text="Список пригодных доменов", callback_data="approved")],
+                [InlineKeyboardButton(text="Очистить список доменов", callback_data="clear_approved")],
+                [InlineKeyboardButton(text="Экспортировать домены", callback_data="export_approved")]
+            ])
+        buttons.extend(admin_buttons)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_full_report_button(domain: str):
@@ -75,7 +265,6 @@ async def get_redis():
             decode_responses=True,
             retry_on_timeout=True
         )
-        logging.debug("Connected to Redis")
         return redis_client
     except Exception as e:
         logging.error(f"Failed to connect to Redis: {str(e)}")
@@ -160,7 +349,6 @@ async def check_daily_limit(user_id: int) -> bool:
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
-    logging.debug(f"Processing /start for user {user_id} (is_admin={is_admin})")
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
@@ -169,14 +357,21 @@ async def cmd_start(message: types.Message):
 
     )
     if is_admin:
+        admin_commands = [
+            "/reset_queue — Сбросить очередь (только для админа)",
+            "/clearcache — Очистить кэш результатов",
+            "/adminhelp — Показать список админских команд"
+        ]
+        if SAVE_APPROVED_DOMAINS:
+            admin_commands.extend([
+                "/approved — Показать список пригодных доменов",
+                "/clear_approved — Очистить список пригодных доменов", 
+                "/export_approved — Экспортировать список доменов в файл"
+            ])
+        
         welcome_message += (
-            "\n🔧 <b>Админ-команды:</b>\n"
-            "/reset_queue — Сбросить очередь (только для админа)\n"
-            "/approved — Показать список пригодных доменов\n"
-            "/clear_approved — Очистить список пригодных доменов\n"
-            "/export_approved — Экспортировать список доменов в файл\n"
-            "/clearcache — Очистить кэш результатов\n"
-            "/adminhelp — Показать список админских команд\n"
+            "\n🔧 <b>Админ-команды:</b>\n" + 
+            "\n".join(admin_commands) + "\n"
         )
     welcome_message += (
         "\n📩 Для проверки, просто отправь мне свой домен для оценки, например: <code>google.com</code> \n"
@@ -188,7 +383,6 @@ async def cmd_start(message: types.Message):
     )
     try:
         await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin))
-        logging.info(f"Sent welcome message to user {user_id} (is_admin={is_admin})")
     except Exception as e:
         logging.error(f"Failed to send welcome message to user {user_id}: {str(e)}")
         await message.answer("❌ Ошибка при отправке сообщения. Попробуйте позже.")
@@ -203,7 +397,6 @@ async def cmd_mode(message: types.Message):
         new_mode = "full" if current_mode == "short" else "short"
         await r.set(f"mode:{user_id}", new_mode)
         await message.reply(f"✅ Режим вывода изменён на: {new_mode}")
-        logging.info(f"User {user_id} changed mode to {new_mode}")
     except Exception as e:
         logging.error(f"Failed to change mode for user {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при смене режима.")
@@ -224,7 +417,6 @@ async def cmd_history(message: types.Message):
         for i, entry in enumerate(history, 1):
             response += f"{i}. {entry}\n"
         await message.reply(response)
-        logging.info(f"User {user_id} viewed history with {len(history)} entries")
     except Exception as e:
         logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при получении истории.")
@@ -238,6 +430,9 @@ async def cmd_approved(message: types.Message):
         await message.reply("⛔ Доступ к этой команде ограничен.")
         logging.warning(f"User {user_id} attempted to access /approved")
         return
+    if not SAVE_APPROVED_DOMAINS:
+        await message.reply("⛔ Функция сохранения доменов отключена в настройках.")
+        return
     r = await get_redis()
     try:
         domains = await r.smembers("approved_domains")
@@ -248,7 +443,6 @@ async def cmd_approved(message: types.Message):
         for i, domain in enumerate(sorted(domains), 1):
             response += f"{i}. {domain}\n"
         await message.reply(response)
-        logging.info(f"User {user_id} viewed approved domains ({len(domains)} entries)")
     except Exception as e:
         logging.error(f"Failed to fetch approved domains for user {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при получении списка доменов.")
@@ -262,11 +456,13 @@ async def cmd_clear_approved(message: types.Message):
         await message.reply("⛔ Доступ к этой команде ограничен.")
         logging.warning(f"User {user_id} attempted to access /clear_approved")
         return
+    if not SAVE_APPROVED_DOMAINS:
+        await message.reply("⛔ Функция сохранения доменов отключена в настройках.")
+        return
     r = await get_redis()
     try:
         deleted = await r.delete("approved_domains")
         await message.reply("✅ Список пригодных доменов очищен." if deleted else "📜 Список пригодных доменов уже пуст.")
-        logging.info(f"User {user_id} cleared approved domains")
     except Exception as e:
         logging.error(f"Failed to clear approved domains for user {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при очистке списка доменов.")
@@ -280,6 +476,9 @@ async def cmd_export_approved(message: types.Message):
         await message.reply("⛔ Доступ к этой команде ограничен.")
         logging.warning(f"User {user_id} attempted to access /export_approved")
         return
+    if not SAVE_APPROVED_DOMAINS:
+        await message.reply("⛔ Функция сохранения доменов отключена в настройках.")
+        return
     r = await get_redis()
     try:
         domains = await r.smembers("approved_domains")
@@ -291,7 +490,6 @@ async def cmd_export_approved(message: types.Message):
             for domain in sorted(domains):
                 f.write(f"{domain}\n")
         await message.reply(f"✅ Список доменов экспортирован в {file_path} ({len(domains)} доменов).")
-        logging.info(f"User {user_id} exported {len(domains)} approved domains to {file_path}")
     except Exception as e:
         logging.error(f"Failed to export approved domains for user {user_id}: {str(e)}")
         await message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
@@ -313,7 +511,6 @@ async def reset_queue_command(message: types.Message):
         if pending_keys:
             await r.delete(*pending_keys)
         await message.reply(f"✅ Очередь сброшена. Удалено задач: {queue_count}, ключей pending: {len(pending_keys)}.")
-        logging.info(f"Admin {user_id} reset queue: {queue_count} tasks, {len(pending_keys)} pending keys")
     except Exception as e:
         logging.error(f"Failed to reset queue by admin {user_id}: {str(e)}")
         await message.reply("❌ Ошибка при сбросе очереди.")
@@ -333,10 +530,8 @@ async def clear_cache_command(message: types.Message):
         if keys:
             await r.delete(*keys)
             await message.reply(f"✅ Кэш очищен. Удалено {len(keys)} записей.")
-            logging.info(f"Admin {user_id} cleared {len(keys)} result keys from Redis cache")
         else:
             await message.reply("✅ Кэш уже пуст.")
-            logging.info(f"Admin {user_id} attempted to clear cache, but it was already empty")
     except Exception as e:
         logging.error(f"Failed to clear cache for user {user_id}: {str(e)}")
         await message.reply(f"❌ Ошибка при очистке кэша: {str(e)}")
@@ -350,17 +545,169 @@ async def admin_help_command(message: types.Message):
         await message.reply("⛔ Эта команда доступна только администратору.")
         logging.warning(f"Non-admin user {user_id} attempted to access /adminhelp")
         return
-    admin_commands = (
-        "📋 <b>Доступные админские команды:</b>\n\n"
-        "/approved — Показать список пригодных доменов\n"
-        "/clear_approved — Очистить список пригодных доменов\n"
-        "/export_approved — Экспортировать список доменов в файл\n"
-        "/reset_queue — Сбросить очередь\n"
-        "/clearcache — Очистить кэш результатов\n"
-        "/adminhelp — Показать этот список команд\n"
-    )
-    await message.reply(admin_commands)
+    admin_commands = ["📋 <b>Доступные админские команды:</b>\n"]
+    admin_commands.extend([
+        "/reset_queue — Сбросить очередь",
+        "/clearcache — Очистить кэш результатов",
+        "/analytics — Показать аналитику бота (NEW!)",
+        "/groups — Управление авторизованными группами (NEW!)",
+        "/groups_add <ID> — Добавить группу в авторизованные",
+        "/groups_remove <ID> — Удалить группу из авторизованных", 
+        "/groups_current — Показать ID текущей группы",
+        "/adminhelp — Показать этот список команд"
+    ])
+    
+    if SAVE_APPROVED_DOMAINS:
+        admin_commands.extend([
+            "/approved — Показать список пригодных доменов",
+            "/clear_approved — Очистить список пригодных доменов",
+            "/export_approved — Экспортировать список доменов в файл"
+        ])
+    
+    await message.reply("\n".join(admin_commands))
     logging.info(f"Admin {user_id} viewed admin commands list")
+
+@router.message(Command("analytics"))
+async def analytics_command(message: types.Message):
+    """Команда для получения аналитики (только для админа)"""
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        logging.warning(f"Non-admin user {user_id} attempted to access /analytics")
+        return
+        
+    if not ANALYTICS_AVAILABLE or not analytics_collector:
+        await message.reply("❌ Аналитика недоступна. Модуль не загружен.")
+        return
+        
+    try:
+        # Получаем отчет по аналитике
+        report = await analytics_collector.generate_analytics_report(user_id)
+        await message.reply(report)
+        
+        # Логируем запрос аналитики
+        await log_analytics("analytics_requested", user_id)
+        logging.info(f"Admin {user_id} requested analytics report")
+        
+    except Exception as e:
+        logging.error(f"Failed to generate analytics for user {user_id}: {str(e)}")
+        await message.reply(f"❌ Ошибка при генерации аналитики: {str(e)}")
+
+@router.message(Command("groups"))
+async def groups_command(message: types.Message):
+    """Команда для управления авторизованными группами (только для админа)"""
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        logging.warning(f"Non-admin user {user_id} attempted to access /groups")
+        return
+    
+    # Информация о текущих настройках
+    if not GROUP_MODE_ENABLED:
+        await message.reply("ℹ️ Режим работы в группах отключен (GROUP_MODE_ENABLED=false)")
+        return
+    
+    if not AUTHORIZED_GROUPS:
+        status = "🌐 <b>Режим авторизации групп:</b> Открытый (любые группы)\n"
+    else:
+        status = f"🔒 <b>Режим авторизации групп:</b> Ограниченный ({len(AUTHORIZED_GROUPS)} групп)\n"
+        status += "📋 <b>Авторизованные группы:</b>\n"
+        for group_id in sorted(AUTHORIZED_GROUPS):
+            try:
+                chat = await bot.get_chat(group_id)
+                group_name = chat.title or "Без названия"
+                status += f"• {group_name} (<code>{group_id}</code>)\n"
+            except Exception:
+                status += f"• ID: <code>{group_id}</code> (недоступна)\n"
+    
+    status += f"\n⚙️ <b>Автовыход:</b> {'Включен' if AUTO_LEAVE_UNAUTHORIZED else 'Отключен'}\n"
+    status += f"🔧 <b>Префикс команд:</b> <code>{GROUP_COMMAND_PREFIX}</code>\n\n"
+    
+    status += "📋 <b>Команды управления:</b>\n"
+    status += "/groups_add <ID> — Добавить группу\n"
+    status += "/groups_remove <ID> — Удалить группу\n"
+    status += "/groups_current — Показать ID текущей группы\n"
+    
+    await message.reply(status)
+
+@router.message(Command("groups_add"))
+async def groups_add_command(message: types.Message):
+    """Добавить группу в список авторизованных"""
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        return
+    
+    # Извлекаем ID группы из команды
+    command_parts = message.text.split()
+    if len(command_parts) < 2:
+        await message.reply("❌ Укажите ID группы: /groups_add -1001234567890")
+        return
+    
+    try:
+        group_id = int(command_parts[1])
+    except ValueError:
+        await message.reply("❌ Неверный формат ID группы. Должно быть число.")
+        return
+    
+    # Добавляем в память (требует перезапуска для постоянного сохранения)
+    AUTHORIZED_GROUPS.add(group_id)
+    
+    try:
+        chat = await bot.get_chat(group_id)
+        group_name = chat.title or "Без названия"
+        await message.reply(f"✅ Группа '{group_name}' (ID: <code>{group_id}</code>) добавлена в список авторизованных.\n\n⚠️ Для постоянного сохранения добавьте ID в переменную AUTHORIZED_GROUPS и перезапустите бота.")
+    except Exception as e:
+        await message.reply(f"✅ ID <code>{group_id}</code> добавлен в список авторизованных.\n⚠️ Не удалось получить информацию о группе: {e}\n\n⚠️ Для постоянного сохранения добавьте ID в переменную AUTHORIZED_GROUPS и перезапустите бота.")
+
+@router.message(Command("groups_remove"))
+async def groups_remove_command(message: types.Message):
+    """Удалить группу из списка авторизованных"""
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        return
+    
+    command_parts = message.text.split()
+    if len(command_parts) < 2:
+        await message.reply("❌ Укажите ID группы: /groups_remove -1001234567890")
+        return
+    
+    try:
+        group_id = int(command_parts[1])
+    except ValueError:
+        await message.reply("❌ Неверный формат ID группы. Должно быть число.")
+        return
+    
+    if group_id in AUTHORIZED_GROUPS:
+        AUTHORIZED_GROUPS.remove(group_id)
+        await message.reply(f"✅ ID <code>{group_id}</code> удален из списка авторизованных.\n\n⚠️ Для постоянного сохранения обновите переменную AUTHORIZED_GROUPS и перезапустите бота.")
+    else:
+        await message.reply(f"❌ ID <code>{group_id}</code> не найден в списке авторизованных групп.")
+
+@router.message(Command("groups_current"))
+async def groups_current_command(message: types.Message):
+    """Показать ID текущей группы"""
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        return
+    
+    if is_group_chat(message):
+        chat_id = message.chat.id
+        is_authorized = is_authorized_group(chat_id)
+        status_emoji = "✅" if is_authorized else "❌"
+        status_text = "авторизована" if is_authorized else "НЕ авторизована"
+        
+        await message.reply(
+            f"ℹ️ <b>Информация о группе:</b>\n"
+            f"📝 Название: {message.chat.title}\n"
+            f"🆔 ID: <code>{chat_id}</code>\n"
+            f"{status_emoji} Статус: {status_text}\n\n"
+            f"💡 Для авторизации: /groups_add {chat_id}"
+        )
+    else:
+        await message.reply("ℹ️ Эта команда работает только в группах. ID этого чата: <code>" + str(message.chat.id) + "</code>")
 
 @router.message(Command("check", "full"))
 async def cmd_check(message: types.Message):
@@ -369,15 +716,27 @@ async def cmd_check(message: types.Message):
     command = command_text.split()[0]
     short_mode = command == "/check"
     args = command_text[len(command):].strip()
+    
+    # Проверяем, это групповой чат
+    if is_group_chat(message) and not await should_respond_in_group(message):
+        return
+    
     if not args:
-        await message.reply(f"⛔ Укажи домен, например: {command} example.com")
+        response = f"⛔ Укажи домен, например: {command} example.com"
+        if is_group_chat(message):
+            response += f"\n\n💡 В группах также можно использовать: {GROUP_COMMAND_PREFIX}check example.com"
+        await send_topic_aware_message(message, response)
         return
+        
     if not await check_rate_limit(user_id):
-        await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
+        await send_topic_aware_message(message, "🚫 Слишком много запросов. Не более 10 в минуту.")
         return
+        
     if not await check_daily_limit(user_id):
-        await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+        await send_topic_aware_message(message, "🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
         return
+        
+    await log_analytics("command_used", user_id, details=f"{command} {args}")
     await handle_domain_logic(message, args, short_mode=short_mode)
     logging.info(f"User {user_id} executed {command} with args: {args}")
 
@@ -385,30 +744,107 @@ async def cmd_check(message: types.Message):
 async def handle_domain(message: types.Message):
     user_id = message.from_user.id
     text = message.text.strip()
-    if not text or text.startswith("/"):
-        logging.debug(f"Ignoring command or empty message from user {user_id}: {text}")
+    
+    # Обработка групповых команд с префиксом
+    if is_group_chat(message) and GROUP_MODE_ENABLED and text.startswith(GROUP_COMMAND_PREFIX):
+        await handle_group_commands(message)
         return
+    
+    # В группах отвечаем только если это упоминание или ответ
+    if is_group_chat(message) and not await should_respond_in_group(message):
+        return
+    
+    if not text or text.startswith("/"):
+        return
+        
     if not await check_rate_limit(user_id):
         await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
         return
+        
     if not await check_daily_limit(user_id):
         await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
         return
+        
+    await log_analytics("domain_message", user_id, details=text)
     await handle_domain_logic(message, text, short_mode=True)
-    logging.info(f"User {user_id} sent domain: {text}")
+
+async def handle_group_commands(message: types.Message):
+    """Обрабатывает команды в группах с префиксом"""
+    text = message.text or ""
+    if not text.startswith(GROUP_COMMAND_PREFIX):
+        return
+        
+    # Удаляем префикс и обрабатываем как обычную команду
+    command_without_prefix = text[len(GROUP_COMMAND_PREFIX):]
+    
+    # Определяем тип команды
+    if command_without_prefix.startswith("check ") or command_without_prefix == "check":
+        short_mode = True
+        args = command_without_prefix[5:].strip() if len(command_without_prefix) > 5 else ""
+    elif command_without_prefix.startswith("full ") or command_without_prefix == "full":
+        short_mode = False
+        args = command_without_prefix[4:].strip() if len(command_without_prefix) > 4 else ""
+    elif command_without_prefix.startswith("help") or command_without_prefix == "help":
+        await handle_group_help(message)
+        return
+    else:
+        # Возможно, это просто домен для проверки
+        if extract_domain(command_without_prefix):
+            short_mode = True
+            args = command_without_prefix
+        else:
+            return
+    
+    user_id = message.from_user.id
+    
+    if not args:
+        await send_topic_aware_message(message,
+            f"⛔ Укажи домен, например: {GROUP_COMMAND_PREFIX}check example.com\n"
+            f"💡 Доступные команды:\n"
+            f"• {GROUP_COMMAND_PREFIX}check example.com — краткая проверка\n"
+            f"• {GROUP_COMMAND_PREFIX}full example.com — полная проверка\n"
+            f"• {GROUP_COMMAND_PREFIX}help — помощь"
+        )
+        return
+        
+    if not await check_rate_limit(user_id):
+        await send_topic_aware_message(message, "🚫 Слишком много запросов. Не более 10 в минуту.")
+        return
+        
+    if not await check_daily_limit(user_id):
+        await send_topic_aware_message(message, "🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+        return
+    
+    await log_analytics("group_command_used", user_id, details=f"{command_without_prefix}")
+    await handle_domain_logic(message, args, short_mode=short_mode)
+    
+async def handle_group_help(message: types.Message):
+    """Показывает помощь для групповых команд"""
+    bot_info = await bot.get_me()
+    help_text = (
+        f"🤖 <b>Помощь по командам бота</b>\n\n"
+        f"📋 <b>Доступные команды в группе:</b>\n"
+        f"• {GROUP_COMMAND_PREFIX}check example.com — Краткая проверка домена\n"
+        f"• {GROUP_COMMAND_PREFIX}full example.com — Полная проверка домена\n"
+        f"• {GROUP_COMMAND_PREFIX}help — Показать эту справку\n\n"
+        f"💡 <b>Также можно:</b>\n"
+        f"• Упомянуть бота: @{bot_info.username} example.com\n"
+        f"• Ответить на сообщение бота с доменом\n\n"
+        f"📊 Лимиты: 10 проверок в минуту, 100 в день на пользователя\n\n"
+        f"🧵 <b>Поддержка тем:</b> Бот отвечает в той же теме, где его упомянули"
+    )
+    await send_topic_aware_message(message, help_text)
 
 @router.callback_query()
 async def process_callback(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
     is_admin = user_id == ADMIN_ID
-    logging.debug(f"Processing callback {callback_query.data} for user {user_id} (is_admin={is_admin})")
     if callback_query.data == "check":
         await callback_query.message.answer("⛔ Укажи домен, например: /check example.com")
     elif callback_query.data == "full":
         await callback_query.message.answer("⛔ Укажи домен, например: /full example.com")
     elif callback_query.data == "ping":
         await callback_query.message.answer("🏓 Я жив!")
-        logging.info(f"User {user_id} triggered ping callback")
     elif callback_query.data == "mode":
         r = await get_redis()
         try:
@@ -417,7 +853,6 @@ async def process_callback(callback_query: types.CallbackQuery):
             new_mode = "full" if current_mode == "short" else "short"
             await r.set(f"mode:{user_id}", new_mode)
             await callback_query.message.reply(f"✅ Режим вывода изменён на: {new_mode}")
-            logging.info(f"User {user_id} changed mode to {new_mode} via callback")
         except Exception as e:
             logging.error(f"Failed to change mode for user {user_id} via callback: {str(e)}")
             await callback_query.message.reply("❌ Ошибка при смене режима.")
@@ -434,29 +869,30 @@ async def process_callback(callback_query: types.CallbackQuery):
                 for i, entry in enumerate(history, 1):
                     response += f"{i}. {entry}\n"
                 await callback_query.message.reply(response)
-            logging.info(f"User {user_id} viewed history via callback with {len(history)} entries")
         except Exception as e:
             logging.error(f"Failed to fetch history for user {user_id}: {str(e)}")
             await callback_query.message.reply("❌ Ошибка при получении истории.")
         finally:
             await r.aclose()
     elif callback_query.data == "approved" and is_admin:
-        r = await get_redis()
-        try:
-            domains = await r.smembers("approved_domains")
-            if not domains:
-                await callback_query.message.reply("📜 Список пригодных доменов пуст.")
-            else:
-                response = "📜 <b>Пригодные домены:</b>\n"
-                for i, domain in enumerate(sorted(domains), 1):
-                    response += f"{i}. {domain}\n"
-                await callback_query.message.reply(response)
-            logging.info(f"User {user_id} viewed approved domains via callback ({len(domains)} entries)")
-        except Exception as e:
-            logging.error(f"Failed to fetch approved domains for user {user_id}: {str(e)}")
-            await callback_query.message.reply("❌ Ошибка при получении списка доменов.")
-        finally:
-            await r.aclose()
+        if not SAVE_APPROVED_DOMAINS:
+            await callback_query.message.reply("⛔ Функция сохранения доменов отключена в настройках.")
+        else:
+            r = await get_redis()
+            try:
+                domains = await r.smembers("approved_domains")
+                if not domains:
+                    await callback_query.message.reply("📜 Список пригодных доменов пуст.")
+                else:
+                    response = "📜 <b>Пригодные домены:</b>\n"
+                    for i, domain in enumerate(sorted(domains), 1):
+                        response += f"{i}. {domain}\n"
+                    await callback_query.message.reply(response)
+            except Exception as e:
+                logging.error(f"Failed to fetch approved domains for user {user_id}: {str(e)}")
+                await callback_query.message.reply("❌ Ошибка при получении списка доменов.")
+            finally:
+                await r.aclose()
             
     elif callback_query.data == "clearcache" and is_admin:
         r = await get_redis()
@@ -465,10 +901,8 @@ async def process_callback(callback_query: types.CallbackQuery):
             if keys:
                 await r.delete(*keys)
                 await callback_query.message.reply(f"✅ Кэш очищен. Удалено {len(keys)} записей.")
-                logging.info(f"Admin {user_id} cleared {len(keys)} result keys via callback")
             else:
                 await callback_query.message.reply("✅ Кэш уже пуст.")
-                logging.info(f"Admin {user_id} attempted to clear cache via callback, but it was empty")
         except Exception as e:
             logging.error(f"Failed to clear cache via callback for user {user_id}: {str(e)}")
             await callback_query.message.reply(f"❌ Ошибка при очистке кэша: {str(e)}")
@@ -476,34 +910,38 @@ async def process_callback(callback_query: types.CallbackQuery):
             await r.aclose()
 
     elif callback_query.data == "clear_approved" and is_admin:
-        r = await get_redis()
-        try:
-            deleted = await r.delete("approved_domains")
-            await callback_query.message.reply("✅ Список пригодных доменов очищен." if deleted else "📜 Список пригодных доменов уже пуст.")
-            logging.info(f"User {user_id} cleared approved domains via callback")
-        except Exception as e:
-            logging.error(f"Failed to clear approved domains for user {user_id}: {str(e)}")
-            await callback_query.message.reply("❌ Ошибка при очистке списка доменов.")
-        finally:
-            await r.aclose()
+        if not SAVE_APPROVED_DOMAINS:
+            await callback_query.message.reply("⛔ Функция сохранения доменов отключена в настройках.")
+        else:
+            r = await get_redis()
+            try:
+                deleted = await r.delete("approved_domains")
+                await callback_query.message.reply("✅ Список пригодных доменов очищен." if deleted else "📜 Список пригодных доменов уже пуст.")
+            except Exception as e:
+                logging.error(f"Failed to clear approved domains for user {user_id}: {str(e)}")
+                await callback_query.message.reply("❌ Ошибка при очистке списка доменов.")
+            finally:
+                await r.aclose()
     elif callback_query.data == "export_approved" and is_admin:
-        r = await get_redis()
-        try:
-            domains = await r.smembers("approved_domains")
-            if not domains:
-                await callback_query.message.reply("📜 Список пригодных доменов пуст. Экспорт не выполнен.")
-            else:
-                file_path = "/app/approved_domains.txt"
-                with open(file_path, "w") as f:
-                    for domain in sorted(domains):
-                        f.write(f"{domain}\n")
-                await callback_query.message.reply(f"✅ Список доменов экспортирован в {file_path} ({len(domains)} доменов).")
-                logging.info(f"User {user_id} exported {len(domains)} approved domains to {file_path} via callback")
-        except Exception as e:
-            logging.error(f"Failed to export approved domains for user {user_id}: {str(e)}")
-            await callback_query.message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
-        finally:
-            await r.aclose()
+        if not SAVE_APPROVED_DOMAINS:
+            await callback_query.message.reply("⛔ Функция сохранения доменов отключена в настройках.")
+        else:
+            r = await get_redis()
+            try:
+                domains = await r.smembers("approved_domains")
+                if not domains:
+                    await callback_query.message.reply("📜 Список пригодных доменов пуст. Экспорт не выполнен.")
+                else:
+                    file_path = "/app/approved_domains.txt"
+                    with open(file_path, "w") as f:
+                        for domain in sorted(domains):
+                            f.write(f"{domain}\n")
+                    await callback_query.message.reply(f"✅ Список доменов экспортирован в {file_path} ({len(domains)} доменов).")
+            except Exception as e:
+                logging.error(f"Failed to export approved domains for user {user_id}: {str(e)}")
+                await callback_query.message.reply(f"❌ Ошибка при экспорте списка доменов: {str(e)}")
+            finally:
+                await r.aclose()
     elif callback_query.data == "reset_queue" and is_admin:
         r = await get_redis()
         try:
@@ -513,7 +951,6 @@ async def process_callback(callback_query: types.CallbackQuery):
             if pending_keys:
                 await r.delete(*pending_keys)
             await callback_query.message.reply(f"✅ Очередь сброшена. Удалено задач: {queue_count}, ключей pending: {len(pending_keys)}.")
-            logging.info(f"Admin {user_id} reset queue via callback: {queue_count} tasks, {len(pending_keys)} pending keys")
         except Exception as e:
             logging.error(f"Failed to reset queue by admin {user_id}: {str(e)}")
             await callback_query.message.reply("❌ Ошибка при сбросе очереди.")
@@ -526,7 +963,6 @@ async def process_callback(callback_query: types.CallbackQuery):
             cached = await r.get(f"result:{domain}")
             if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):
                 await callback_query.message.answer(f"⚡ Полный отчёт для {domain}:\n\n{cached}")
-                logging.info(f"Returned cached full report for {domain} to user {user_id}")
             else:
                 if not await check_rate_limit(user_id):
                     await callback_query.message.answer("🚫 Слишком много запросов. Не более 10 в минуту.")
@@ -538,7 +974,6 @@ async def process_callback(callback_query: types.CallbackQuery):
                         await callback_query.message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт.")
                     else:
                         await callback_query.message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
-                    logging.info(f"Enqueued {domain} for full report for user {user_id}")
         except Exception as e:
             logging.error(f"Failed to process full report for {domain} by user {user_id}: {str(e)}")
             await callback_query.message.answer(f"❌ Ошибка: {str(e)}")
@@ -581,7 +1016,7 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                 logging.warning(f"Invalid domain input: {domain} by user {user_id}")
 
         if invalid_domains:
-            await message.reply(
+            await send_topic_aware_message(message,
                 f"⚠️ Следующие домены невалидны и будут пропущены:\n" +
                 "\n".join(f"- {d}" for d in invalid_domains)
             )
@@ -589,12 +1024,73 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
         if not valid_domains:
             if len(invalid_domains) >= inconclusive_domain_limit:
                 timeout = register_violation(user_id)
-                await message.reply(f"❌ Все домены невалидны. Пользователь ограничен на {timeout//60} минут.")
+                await send_topic_aware_message(message, f"❌ Все домены невалидны. Пользователь ограничен на {timeout//60} минут.")
             else:
-                await message.reply("❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
+                await send_topic_aware_message(message, "❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
             return
 
+        # Если доменов много и доступен BatchProcessor, используем его
+        if len(valid_domains) > 2 and PROGRESS_AVAILABLE:
+            try:
+                batch_processor = BatchProcessor(bot, batch_size=3)
+                
+                async def check_domain_wrapper(domain, user_id, short_mode):
+                    """Обертка для проверки домена с логированием аналитики"""
+                    start_time = time()
+                    try:
+                        # Проверяем кэш
+                        r = await get_redis()
+                        cached = await r.get(f"result:{domain}")
+                        await r.aclose()
+                        
+                        if cached:
+                            await log_analytics("domain_check", user_id, 
+                                              domain=domain, check_type="short" if short_mode else "full", 
+                                              result_status="cached", execution_time=time() - start_time)
+                            return f"⚡ Результат из кэша для {domain}:\n\n{cached}"
+                        
+                        # Ставим в очередь
+                        enqueued = await enqueue(domain, user_id, short_mode=short_mode)
+                        if enqueued:
+                            await log_analytics("domain_check", user_id,
+                                              domain=domain, check_type="short" if short_mode else "full",
+                                              result_status="queued", execution_time=time() - start_time)
+                            return f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт."
+                        else:
+                            return f"⚠️ <b>{domain}</b> уже в очереди на проверку."
+                    except Exception as e:
+                        await log_analytics("domain_check", user_id,
+                                          domain=domain, check_type="short" if short_mode else "full",
+                                          result_status="failed", execution_time=time() - start_time)
+                        raise e
+                
+                # Используем батч-обработку с прогрессом
+                results = await batch_processor.process_domains(
+                    valid_domains, user_id, message, check_domain_wrapper, short_mode
+                )
+                
+                # Отправляем итоговую статистику
+                summary = (
+                    f"📊 <b>Обработка завершена:</b>\n"
+                    f"• Обработано: {len(results['successful']) + len(results['cached'])}\n"
+                    f"• Из кэша: {len(results['cached'])}\n"
+                    f"• Неудач: {len(results['failed'])}\n"
+                )
+                
+                if results['errors']:
+                    summary += f"\n❌ <b>Ошибки:</b>\n" + "\n".join(f"• {error}" for error in results['errors'][:3])
+                    if len(results['errors']) > 3:
+                        summary += f"\n... и еще {len(results['errors']) - 3} ошибок"
+                
+                await send_topic_aware_message(message, summary)
+                return
+                
+            except Exception as e:
+                logging.error(f"Batch processing failed: {e}, falling back to individual processing")
+        
+        # Обычная обработка доменов (по одному)
         for domain in valid_domains:
+            start_time = time()
             cached = await r.get(f"result:{domain}")
             is_full_report = cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"])
             if cached and (short_mode or is_full_report):
@@ -603,11 +1099,6 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                     filtered_lines = []
                     include_next = False
                     for line in lines:
-                        # Включаем заголовок
-                        if "🔍 Проверка" in line:
-                            filtered_lines.append(line)
-                            continue
-                        # Включаем строки с ключевыми словами и следующие за ними
                         if any(k in line for k in ["🟢 Ping", "🔒 TLS", "🌐 HTTP", "🛡", "🟢 CDN", "🛰 Оценка пригодности"]):
                             filtered_lines.append(line)
                             include_next = True  # Включаем следующую строку (например, после "🔒 TLS")
@@ -617,43 +1108,57 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                         else:
                             include_next = False
                     filtered = "\n".join(filtered_lines)
-                    await message.answer(
+                    await send_topic_aware_message(message,
                         f"⚡ Результат из кэша для {domain}:\n\n{filtered}",
                         reply_markup=get_full_report_button(domain)
                     )
+                    await log_analytics("domain_check", user_id,
+                                      domain=domain, check_type="short" if short_mode else "full",
+                                      result_status="cached", execution_time=time() - start_time)
                     logging.info(f"Returned cached short report for {domain} to user {user_id}")
                 else:
-                    await message.answer(f"⚡ Полный отчёт из кэша для {domain}:\n\n{cached}")
+                    await send_topic_aware_message(message, f"⚡ Полный результат из кэша для {domain}:\n\n{cached}")
+                    await log_analytics("domain_check", user_id,
+                                      domain=domain, check_type="full",
+                                      result_status="cached", execution_time=time() - start_time)
                     logging.info(f"Returned cached full report for {domain} to user {user_id}")
+                await r.lpush(f"history:{user_id}", f"{datetime.now().strftime('%Y-%m-%d %H:%M')} - {domain}")
+                await r.ltrim(f"history:{user_id}", 0, 9)
             else:
-                if not await check_rate_limit(user_id):
-                    await message.reply("🚫 Слишком много запросов. Не более 10 в минуту.")
-                    return
-                if not await check_daily_limit(user_id):
-                    await message.reply("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
-                    return
                 enqueued = await enqueue(domain, user_id, short_mode=short_mode)
                 if enqueued:
-                    await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт.")
+                    await send_topic_aware_message(message, f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт.")
+                    await log_analytics("domain_check", user_id,
+                                      domain=domain, check_type="short" if short_mode else "full",
+                                      result_status="queued", execution_time=time() - start_time)
                 else:
-                    await message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
+                    await send_topic_aware_message(message, f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
                 logging.info(f"Enqueued {domain} for user {user_id} (short_mode={short_mode})")
     except Exception as e:
         logging.error(f"Failed to process domains for user {user_id}: {str(e)}")
-        await message.reply(f"❌ Ошибка: {str(e)}")
+        await send_topic_aware_message(message, f"❌ Ошибка: {str(e)}")
     finally:
         await r.aclose()
 
 async def main():
+    """Основная функция запуска бота"""
     from aiogram import Dispatcher
+    
+    # Инициализируем аналитику
+    await init_analytics()
+    
     dp = Dispatcher()
     dp.include_router(router)
-    logging.info("Starting bot polling...")
+    
     try:
+        logging.info("🚀 Starting Domain Reality Bot...")
         await dp.start_polling(bot)
+    except Exception as e:
+        logging.error(f"Error starting bot: {e}")
     finally:
-        logging.info("Bot polling stopped.")
+        await bot.session.close()
 
 if __name__ == "__main__":
-    logging.debug("Starting bot script")
+    logging.info("Starting bot script")
+    asyncio.run(main())
     asyncio.run(main())

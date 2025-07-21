@@ -5,13 +5,14 @@ from logging.handlers import RotatingFileHandler
 
 # Настройка логирования
 log_file = "/app/redis_queue.log"
-handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+# Уменьшаем размер файла логов и количество бэкапов
+handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # Изменено с INFO на WARNING
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[handler, logging.StreamHandler()]
 )
-logging.info("Redis queue logging initialized")
+# Убираем инициализационный лог
 
 async def get_redis():
     try:
@@ -22,7 +23,7 @@ async def get_redis():
             decode_responses=True,
             retry_on_timeout=True
         )
-        logging.debug("Connected to Redis from redis_queue")
+        # Убираем debug лог подключения
         return redis_client
     except Exception as e:
         logging.error(f"Failed to connect to Redis: {str(e)}")

@@ -9,6 +9,11 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD}
       - ADMIN_ID=${ADMIN_ID}
+      - SAVE_APPROVED_DOMAINS=${SAVE_APPROVED_DOMAINS:-false}
+      - GROUP_MODE_ENABLED=${GROUP_MODE_ENABLED:-true}
+      - GROUP_COMMAND_PREFIX=${GROUP_COMMAND_PREFIX:-!}
+      - AUTHORIZED_GROUPS=${AUTHORIZED_GROUPS:-}
+      - AUTO_LEAVE_UNAUTHORIZED=${AUTO_LEAVE_UNAUTHORIZED:-false}
     depends_on:
       - redis
     volumes:
@@ -24,8 +29,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "5m"  # Уменьшено с 10m
+        max-file: "2"   # Уменьшено с 3
         compress: "true"
   worker:
     image: ghcr.io/dignezzz/bot-reality:latest
@@ -36,6 +41,11 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD}
       - ADMIN_ID=${ADMIN_ID}
+      - SAVE_APPROVED_DOMAINS=${SAVE_APPROVED_DOMAINS:-false}
+      - GROUP_MODE_ENABLED=${GROUP_MODE_ENABLED:-true}
+      - GROUP_COMMAND_PREFIX=${GROUP_COMMAND_PREFIX:-!}
+      - AUTHORIZED_GROUPS=${AUTHORIZED_GROUPS:-}
+      - AUTO_LEAVE_UNAUTHORIZED=${AUTO_LEAVE_UNAUTHORIZED:-false}
     depends_on:
       - redis
     volumes:
@@ -53,8 +63,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "5m"  # Уменьшено с 10m  
+        max-file: "2"   # Уменьшено с 3
         compress: "true"
   redis:
     container_name: domain-redis

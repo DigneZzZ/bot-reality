@@ -7,59 +7,137 @@ from redis_queue import get_redis
 from aiogram import Bot
 from bot import get_full_report_button
 from checker import run_check  # Импорт функции из checker.py
+from datetime import datetime
+
+# Импортируем новые модули (если доступны)
+try:
+    from retry_logic import retry_with_backoff, DOMAIN_CHECK_RETRY, REDIS_RETRY
+    RETRY_AVAILABLE = True
+except ImportError:
+    RETRY_AVAILABLE = False
+    
+try:
+    from analytics import AnalyticsCollector
+    ANALYTICS_AVAILABLE = True
+except ImportError:
+    ANALYTICS_AVAILABLE = False
 
 # Настройка логирования
 log_file = "/app/worker.log"
-handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+# Уменьшаем размер файла логов и количество бэкапов
+handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # Изменено с INFO на WARNING
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[handler, logging.StreamHandler()]
 )
-logging.info("Worker logging initialized")
 
 # Инициализация Telegram Bot
 TOKEN = os.getenv("BOT_TOKEN")
+SAVE_APPROVED_DOMAINS = os.getenv("SAVE_APPROVED_DOMAINS", "false").lower() == "true"
 if not TOKEN:
     logging.error("BOT_TOKEN environment variable is not set")
     raise ValueError("BOT_TOKEN environment variable is not set")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 
+# Инициализация аналитики
+analytics_collector = None
+
+async def init_analytics():
+    """Инициализирует аналитику"""
+    global analytics_collector
+    if ANALYTICS_AVAILABLE:
+        try:
+            redis_client = await get_redis()
+            analytics_collector = AnalyticsCollector(redis_client)
+            logging.info("Worker analytics initialized successfully")
+        except Exception as e:
+            logging.warning(f"Failed to initialize worker analytics: {e}")
+
+async def log_analytics(action: str, user_id: int, **kwargs):
+    """Логирует событие в аналитику"""
+    if analytics_collector:
+        try:
+            if action == "domain_check":
+                await analytics_collector.log_domain_check(
+                    user_id=user_id,
+                    domain=kwargs.get("domain", ""),
+                    check_type=kwargs.get("check_type", "short"),
+                    result_status=kwargs.get("result_status", "unknown"),
+                    execution_time=kwargs.get("execution_time")
+                )
+        except Exception as e:
+            logging.warning(f"Failed to log worker analytics: {e}")
+
 async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
-    logging.info(f"Starting check for {domain} for user {user_id}, short_mode={short_mode}")
+    """Проверяет домен с retry логикой и аналитикой"""
+    start_time = datetime.now()
+    
+    async def perform_check():
+        """Внутренняя функция для выполнения проверки"""
+        try:
+            # Вызываем функцию из checker.py с таймаутом
+            async with asyncio.timeout(300):
+                # run_check не асинхронна, поэтому запускаем её в потоке
+                loop = asyncio.get_event_loop()
+                report = await loop.run_in_executor(None, lambda: run_check(domain, full_report=not short_mode))
+                return report
+        except asyncio.TimeoutError:
+            logging.error(f"Timeout while checking {domain} for user {user_id}")
+            raise asyncio.TimeoutError(f"Проверка {domain} прервана: превышено время ожидания (5 минут).")
+    
     try:
-        # Вызываем функцию из checker.py с таймаутом
-        async with asyncio.timeout(300):
-            # run_check не асинхронна, поэтому запускаем её в потоке
-            loop = asyncio.get_event_loop()
-            report = await loop.run_in_executor(None, lambda: run_check(domain, full_report=not short_mode))
-    except asyncio.TimeoutError:
-        logging.error(f"Timeout while checking {domain} for user {user_id}")
-        output = f"❌ Проверка {domain} прервана: превышено время ожидания (5 минут)."
+        # Используем retry логику если доступна
+        if RETRY_AVAILABLE:
+            report = await retry_with_backoff(perform_check, DOMAIN_CHECK_RETRY)
+        else:
+            report = await perform_check()
+            
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        # Логируем успешную проверку
+        await log_analytics("domain_check", user_id,
+                           domain=domain, 
+                           check_type="short" if short_mode else "full",
+                           result_status="success",
+                           execution_time=execution_time)
+        
+    except Exception as e:
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        # Логируем неудачную проверку
+        await log_analytics("domain_check", user_id,
+                           domain=domain,
+                           check_type="short" if short_mode else "full", 
+                           result_status="failed",
+                           execution_time=execution_time)
+        
+        logging.error(f"Failed to check {domain} for user {user_id}: {str(e)}")
+        
+        # Удаляем pending ключ
         r = await get_redis()
         try:
             await r.delete(f"pending:{domain}:{user_id}")
-            logging.info(f"Removed pending flag for {domain} for user {user_id} due to timeout")
         finally:
             await r.aclose()
-        return output
+            
+        return f"❌ Ошибка при проверке {domain}: {str(e)}"
 
+    # Сохраняем результат
     r = await get_redis()
     try:
         # Сохраняем полный отчет в кэш
         await r.set(f"result:{domain}", report, ex=86400)
 
-        # Проверяем пригодность домена и добавляем в approved_domains
-        if "✅ Пригоден для Reality" in report:
+        # Проверяем пригодность домена и добавляем в approved_domains (только если включена опция)
+        if SAVE_APPROVED_DOMAINS and "✅ Пригоден для Reality" in report:
             await r.sadd("approved_domains", domain)
-            logging.info(f"Added {domain} to approved_domains for user {user_id}")
 
         output = report  # Используем отчет напрямую из run_check
 
         await r.lpush(f"history:{user_id}", f"{domain}: {'Краткий' if short_mode else 'Полный'} отчёт")
         await r.ltrim(f"history:{user_id}", 0, 9)
         await r.delete(f"pending:{domain}:{user_id}")
-        logging.info(f"Processed {domain} for user {user_id}, short_mode={short_mode}")
         return output
     except Exception as e:
         logging.error(f"Failed to save result for {domain}: {str(e)}")
@@ -73,7 +151,6 @@ async def clear_cache(r: redis.Redis):
         keys = await r.keys("result:*")
         if keys:
             await r.delete(*keys)
-            logging.info(f"Cleared {len(keys)} result keys from Redis cache")
     except Exception as e:
         logging.error(f"Failed to clear cache: {str(e)}")
 
@@ -83,11 +160,9 @@ async def cache_cleanup_task(r: redis.Redis):
         await asyncio.sleep(86400)
 
 async def worker():
-    logging.info("Starting worker process")
     r = await get_redis()
     try:
         await r.ping()
-        logging.info("Successfully connected to Redis")
         asyncio.create_task(cache_cleanup_task(r))
         while True:
             try:
@@ -95,14 +170,12 @@ async def worker():
                 if result is None:
                     continue
                 _, task = result
-                logging.info(f"Popped task from queue: {task}")
                 domain, user_id, short_mode = task.split(":")
                 user_id = int(user_id)
                 short_mode = short_mode == "True"
                 result = await check_domain(domain, user_id, short_mode)
                 try:
                     await bot.send_message(user_id, result, reply_markup=get_full_report_button(domain) if short_mode else None)
-                    logging.info(f"Sent result for {domain} to user {user_id}")
                 except Exception as e:
                     logging.error(f"Failed to send message to user {user_id} for {domain}: {str(e)}")
             except Exception as e:
@@ -112,7 +185,6 @@ async def worker():
         logging.error(f"Failed to initialize worker: {str(e)}")
     finally:
         await r.aclose()
-        logging.info("Worker stopped")
 
 if __name__ == "__main__":
     asyncio.run(worker())
