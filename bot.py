@@ -23,18 +23,34 @@ except ImportError:
     PROGRESS_AVAILABLE = False
 
 try:
-    from analytics import AnalyticsCollector
+    import analytics
     ANALYTICS_AVAILABLE = True
 except ImportError:
     ANALYTICS_AVAILABLE = False
-    class AnalyticsCollector:
-        """Dummy class for when the analytics module is not available."""
-        def __init__(self, *args, **kwargs):
-            logging.warning("Using DummyAnalyticsCollector because 'analytics' module was not found.")
-        async def log_user_activity(self, *args, **kwargs):
-            pass
-        async def generate_analytics_report(self, *args, **kwargs):
-            return "Аналитика недоступна."
+    analytics = None
+
+class AnalyticsCollector:
+    """Analytics collector that works with or without the analytics module."""
+    def __init__(self, *args, **kwargs):
+        if ANALYTICS_AVAILABLE and analytics:
+            try:
+                self._real_collector = analytics.AnalyticsCollector(*args, **kwargs)
+                logging.info("Real analytics collector initialized")
+            except Exception as e:
+                logging.warning(f"Failed to init real analytics: {e}")
+                self._real_collector = None
+        else:
+            self._real_collector = None
+            logging.warning("Using dummy analytics collector")
+    
+    async def log_user_activity(self, *args, **kwargs):
+        if self._real_collector:
+            return await self._real_collector.log_user_activity(*args, **kwargs)
+    
+    async def generate_analytics_report(self, *args, **kwargs):
+        if self._real_collector:
+            return await self._real_collector.generate_analytics_report(*args, **kwargs)
+        return "Аналитика недоступна."
 
 # --- Logging Setup ---
 log_dir = os.getenv("LOG_DIR", "/tmp")
@@ -84,7 +100,7 @@ if not BOT_USERNAME:
 
 bot = Bot(token=TOKEN, parse_mode="HTML")
 router = Router()
-analytics_collector: Optional[AnalyticsCollector] = None
+analytics_collector = None
 
 # --- Redis Connection ---
 async def get_redis_connection() -> redis.Redis:
@@ -222,7 +238,7 @@ async def check_limits(user_id: int, is_group: bool, chat_id: Optional[int]) -> 
         # Daily limit
         daily_limit = GROUP_DAILY_LIMIT if is_group else PRIVATE_DAILY_LIMIT
         daily_key_suffix = f":{chat_id}" if is_group and chat_id else ""
-        daily_key = f"daily:{user_id}{daily_key_suffix}:{datetime.now().strftime('%Y%m%d')}
+        daily_key = f"daily:{user_id}{daily_key_suffix}:{datetime.now().strftime('%Y%m%d')}"
         
         current_daily = await r.incr(daily_key)
         if current_daily == 1:
