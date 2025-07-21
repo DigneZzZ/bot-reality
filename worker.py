@@ -163,9 +163,21 @@ async def cache_cleanup_task(r: redis.Redis):
         await asyncio.sleep(86400)
 
 def get_group_full_report_button(domain: str, user_id: int):
-    """Создаёт кнопку для получения полного отчёта в ЛС"""
+    """Создаёт кнопку с deep link для получения полного отчёта в ЛС"""
+    bot_username = os.getenv("BOT_USERNAME", "bot")  # Замените на актуальное имя бота
+    deep_link = f"https://t.me/{bot_username}?start=full_{domain}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", callback_data=f"full_pm:{domain}:{user_id}")]
+        [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", url=deep_link)]
+    ])
+    return keyboard
+
+def get_deep_link_button(domain: str):
+    """Создаёт кнопку с deep link на бота для получения полного отчёта"""
+    # Получаем имя бота из токена или используем переменную окружения
+    bot_username = os.getenv("BOT_USERNAME", "bot")  # Замените на актуальное имя бота
+    deep_link = f"https://t.me/{bot_username}?start=full_{domain}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Получить полный отчёт", url=deep_link)]
     ])
     return keyboard
 
@@ -261,11 +273,20 @@ async def worker():
                             keyboard = get_group_full_report_button(domain, user_id)
                             await send_group_reply(chat_id, message_id, thread_id, result, keyboard)
                         else:
-                            # Полный отчёт в группе не отправляем, отправляем в ЛС
-                            await bot.send_message(user_id, f"📄 Полный отчёт для {domain}:\n\n{result}")
-                            # В группе уведомляем о том, что отчёт отправлен в ЛС
-                            await send_group_reply(chat_id, message_id, thread_id, 
-                                                 f"✅ Полный отчёт для <b>{domain}</b> отправлен вам в личные сообщения.")
+                            # Полный отчёт пытаемся отправить в ЛС
+                            try:
+                                await bot.send_message(user_id, f"📄 Полный отчёт для {domain}:\n\n{result}")
+                                # В группе уведомляем об успешной отправке
+                                await send_group_reply(chat_id, message_id, thread_id, 
+                                                     f"✅ Полный отчёт для <b>{domain}</b> отправлен вам в личные сообщения.")
+                            except Exception as pm_error:
+                                # Не удалось отправить в ЛС (скорее всего диалог не начат)
+                                logging.warning(f"Failed to send PM to user {user_id}: {pm_error}")
+                                
+                                # Отправляем уведомление с кнопкой deep link
+                                warning_text = f"⚠️ Не удалось отправить полный отчёт в ЛС для <b>{domain}</b>"
+                                deep_link_keyboard = get_deep_link_button(domain)
+                                await send_group_reply(chat_id, message_id, thread_id, warning_text, deep_link_keyboard)
                     else:
                         # В ЛС отправляем как обычно
                         await bot.send_message(user_id, result, 

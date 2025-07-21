@@ -257,9 +257,11 @@ def get_full_report_button(domain: str):
     return keyboard
 
 def get_group_full_report_button(domain: str, user_id: int):
-    """Создаёт кнопку для получения полного отчёта в ЛС из группового чата"""
+    """Создаёт кнопку с deep link для получения полного отчёта в ЛС из группового чата"""
+    bot_username = os.getenv("BOT_USERNAME", "bot")  # Замените на актуальное имя бота
+    deep_link = f"https://t.me/{bot_username}?start=full_{domain}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", callback_data=f"full_pm:{domain}:{user_id}")]
+        [InlineKeyboardButton(text="📄 Полный отчёт в ЛС", url=deep_link)]
     ])
     return keyboard
 
@@ -356,6 +358,16 @@ async def check_daily_limit(user_id: int) -> bool:
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
+    
+    # Проверяем deep link параметры
+    if message.text and len(message.text.split()) > 1:
+        param = message.text.split()[1]
+        if param.startswith("full_"):
+            domain = param[5:]  # Убираем "full_" префикс
+            # Обрабатываем запрос полного отчёта
+            await handle_deep_link_full_report(message, domain)
+            return
+    
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для Reality.\n\n"
         "📋 <b>Доступные команды:</b>\n"
@@ -393,6 +405,45 @@ async def cmd_start(message: types.Message):
     except Exception as e:
         logging.error(f"Failed to send welcome message to user {user_id}: {str(e)}")
         await message.answer("❌ Ошибка при отправке сообщения. Попробуйте позже.")
+
+async def handle_deep_link_full_report(message: types.Message, domain: str):
+    """Обрабатывает запрос полного отчёта через deep link"""
+    user_id = message.from_user.id
+    
+    # Проверяем лимиты
+    if not await check_rate_limit(user_id):
+        await message.answer("🚫 Слишком много запросов. Не более 10 в минуту.")
+        return
+        
+    if not await check_daily_limit(user_id):
+        await message.answer("🚫 Достигнут дневной лимит (100 проверок). Попробуйте завтра.")
+        return
+    
+    # Проверяем кэш
+    r = await get_redis()
+    try:
+        cached = await r.get(f"result:{domain}")
+        if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):
+            # Отправляем полный отчёт из кэша
+            await message.answer(f"📄 Полный отчёт для {domain}:\n\n{cached}")
+            await log_analytics("domain_check", user_id,
+                              domain=domain, check_type="full",
+                              result_status="cached", execution_time=0)
+        else:
+            # Ставим в очередь на полный отчёт
+            enqueued = await enqueue(domain, user_id, short_mode=False, chat_id=user_id)
+            if enqueued:
+                await message.answer(f"✅ <b>{domain}</b> поставлен в очередь на полный отчёт. Результат придёт сюда.")
+                await log_analytics("domain_check", user_id,
+                                  domain=domain, check_type="full",
+                                  result_status="queued", execution_time=0)
+            else:
+                await message.answer(f"⚠️ <b>{domain}</b> уже в очереди на проверку.")
+    except Exception as e:
+        logging.error(f"Failed to process deep link full report for {domain} by user {user_id}: {str(e)}")
+        await message.answer(f"❌ Ошибка при обработке запроса для {domain}: {str(e)}")
+    finally:
+        await r.aclose()
 
 @router.message(Command("mode"))
 async def cmd_mode(message: types.Message):
@@ -1012,9 +1063,17 @@ async def process_callback(callback_query: types.CallbackQuery):
             try:
                 cached = await r.get(f"result:{domain}")
                 if cached and all(k in cached for k in ["🌍 География", "📄 WHOIS", "⏱️ TTFB"]):
-                    # Отправляем полный отчёт в ЛС
-                    await bot.send_message(user_id, f"📄 Полный отчёт для {domain}:\n\n{cached}")
-                    await callback_query.answer("✅ Полный отчёт отправлен в ЛС")
+                    # Пытаемся отправить полный отчёт в ЛС
+                    try:
+                        await bot.send_message(user_id, f"📄 Полный отчёт для {domain}:\n\n{cached}")
+                        await callback_query.answer("✅ Полный отчёт отправлен в ЛС")
+                    except Exception as pm_error:
+                        # Не удалось отправить в ЛС
+                        await callback_query.answer(
+                            "❌ Не удалось отправить в ЛС. Начните диалог с ботом командой /start", 
+                            show_alert=True
+                        )
+                        logging.warning(f"Failed to send PM to user {user_id} via callback: {pm_error}")
                 else:
                     # Ставим в очередь на полный отчёт в ЛС
                     enqueued = await enqueue(domain, user_id, short_mode=False, chat_id=user_id)
