@@ -90,9 +90,12 @@ async def init_analytics():
         try:
             redis_client = await get_redis()
             analytics_collector = AnalyticsCollector(redis_client)
-            logging.info("Analytics initialized successfully")
+            logging.info("✅ Analytics initialized successfully")
         except Exception as e:
-            logging.warning(f"Failed to initialize analytics: {e}")
+            logging.warning(f"❌ Failed to initialize analytics: {e}")
+            logging.warning("💡 Check Redis connection and settings")
+    else:
+        logging.warning("❌ Analytics module not available - check dependencies")
 
 def is_group_chat(message: types.Message) -> bool:
     """Проверяет, является ли чат групповым"""
@@ -367,6 +370,31 @@ async def cmd_start(message: types.Message):
             # Обрабатываем запрос полного отчёта
             await handle_deep_link_full_report(message, domain)
             return
+        elif param.startswith("result_"):
+            # result_domain_userid - запрос результата конкретного домена
+            parts = param[7:].split("_", 1)  # Убираем "result_" префикс
+            if len(parts) >= 2:
+                domain = parts[0]
+                try:
+                    target_user_id = int(parts[1])
+                    if user_id == target_user_id:
+                        await handle_deep_link_single_result(message, domain)
+                    else:
+                        await message.answer("❌ Этот результат предназначен не для вас.")
+                except ValueError:
+                    await message.answer("❌ Неверный формат ссылки.")
+            return
+        elif param.startswith("results_all_"):
+            # results_all_userid - запрос всех результатов пользователя
+            try:
+                target_user_id = int(param[12:])  # Убираем "results_all_" префикс
+                if user_id == target_user_id:
+                    await handle_deep_link_all_results(message, user_id)
+                else:
+                    await message.answer("❌ Эти результаты предназначены не для вас.")
+            except ValueError:
+                await message.answer("❌ Неверный формат ссылки.")
+            return
     
     welcome_message = (
         "👋 <b>Привет!</b> Я бот для проверки доменов на пригодность для Reality.\n\n"
@@ -405,6 +433,172 @@ async def cmd_start(message: types.Message):
     except Exception as e:
         logging.error(f"Failed to send welcome message to user {user_id}: {str(e)}")
         await message.answer("❌ Ошибка при отправке сообщения. Попробуйте позже.")
+
+async def handle_bulk_domains_in_group(message: types.Message, domains: list, user_id: int, short_mode: bool):
+    """Обрабатывает массовые запросы доменов в группах - один ответ с кнопками"""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    
+    # Логируем массовый запрос
+    await log_analytics("bulk_domain_request", user_id, 
+                       details=f"group_chat, domains_count={len(domains)}, short_mode={short_mode}")
+    
+    # Проверяем, есть ли результаты в кэше
+    r = await get_redis()
+    try:
+        cached_domains = []
+        pending_domains = []
+        
+        for domain in domains:
+            cached = await r.get(f"result:{domain}")
+            if cached:
+                cached_domains.append(domain)
+            else:
+                pending_domains.append(domain)
+        
+        # Ставим в очередь те домены, которых нет в кэше
+        for domain in pending_domains:
+            chat_id = message.chat.id
+            message_id = message.message_id
+            thread_id = get_topic_thread_id(message)
+            
+            enqueued = await enqueue(domain, user_id, short_mode=short_mode,
+                                   chat_id=chat_id, message_id=message_id, thread_id=thread_id)
+            await log_analytics("domain_check", user_id,
+                              domain=domain, check_type="short" if short_mode else "full",
+                              result_status="queued" if enqueued else "already_queued")
+        
+        # Создаем кнопки для получения результатов в ЛС
+        buttons = []
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+        
+        # Разбиваем домены на группы по 3 для кнопок
+        for i in range(0, len(domains), 3):
+            batch = domains[i:i+3]
+            row = []
+            for domain in batch:
+                # Создаем deep link для получения результата в ЛС
+                deep_link = f"https://t.me/{bot_username}?start=result_{domain}_{user_id}"
+                row.append(InlineKeyboardButton(
+                    text=f"📄 {domain}", 
+                    url=deep_link
+                ))
+            buttons.append(row)
+        
+        # Добавляем кнопку для получения всех результатов сразу
+        if len(domains) > 1:
+            all_domains_param = "_".join(domains[:5])  # Ограничиваем длину
+            deep_link_all = f"https://t.me/{bot_username}?start=results_all_{user_id}"
+            buttons.append([InlineKeyboardButton(
+                text="📄 Все результаты в ЛС", 
+                url=deep_link_all
+            )])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        
+        # Формируем сообщение
+        response_text = (
+            f"🔍 <b>Обработка {len(domains)} доменов</b>\n\n"
+            f"📊 <b>Статус:</b>\n"
+            f"• Из кэша: {len(cached_domains)}\n"
+            f"• В очереди: {len(pending_domains)}\n\n"
+            f"💡 <b>Получить результаты:</b>\n"
+            f"Нажмите на кнопки ниже для перехода в ЛС с ботом"
+        )
+        
+        if cached_domains:
+            response_text += f"\n\n✅ <b>Готовые:</b> {', '.join(cached_domains[:5])}"
+            if len(cached_domains) > 5:
+                response_text += f" и ещё {len(cached_domains) - 5}..."
+        
+        if pending_domains:
+            response_text += f"\n\n⏳ <b>В обработке:</b> {', '.join(pending_domains[:5])}"
+            if len(pending_domains) > 5:
+                response_text += f" и ещё {len(pending_domains) - 5}..."
+        
+        await send_topic_aware_message(message, response_text, reply_markup=keyboard)
+        
+    except Exception as e:
+        logging.error(f"Failed to handle bulk domains in group: {e}")
+        await send_topic_aware_message(message, f"❌ Ошибка при обработке массового запроса: {str(e)}")
+    finally:
+        await r.aclose()
+
+async def handle_deep_link_single_result(message: types.Message, domain: str):
+    """Обрабатывает запрос результата конкретного домена через deep link"""
+    user_id = message.from_user.id
+    
+    r = await get_redis()
+    try:
+        cached = await r.get(f"result:{domain}")
+        if cached:
+            await message.answer(f"📄 Результат для {domain}:\n\n{cached}")
+            await log_analytics("domain_check", user_id,
+                              domain=domain, check_type="single_result",
+                              result_status="cached", execution_time=0)
+        else:
+            # Проверяем, есть ли домен в очереди
+            await message.answer(
+                f"⏳ Результат для {domain} пока не готов.\n\n"
+                f"💡 Возможные причины:\n"
+                f"• Домен ещё обрабатывается\n"
+                f"• Результат устарел и был удален из кэша\n"
+                f"• Произошла ошибка при обработке\n\n"
+                f"🔄 Попробуйте запросить проверку заново: /check {domain}"
+            )
+    except Exception as e:
+        logging.error(f"Failed to get single result for {domain} by user {user_id}: {str(e)}")
+        await message.answer(f"❌ Ошибка при получении результата для {domain}: {str(e)}")
+    finally:
+        await r.aclose()
+
+async def handle_deep_link_all_results(message: types.Message, user_id: int):
+    """Обрабатывает запрос всех результатов пользователя через deep link"""
+    r = await get_redis()
+    try:
+        # Получаем историю пользователя
+        history = await r.lrange(f"history:{user_id}", 0, 19)  # Последние 20 записей
+        
+        if not history:
+            await message.answer("📜 У вас пока нет результатов проверок.")
+            return
+        
+        results_text = "📄 <b>Ваши последние результаты:</b>\n\n"
+        found_results = 0
+        
+        for entry in history:
+            if " - " in entry:
+                domain = entry.split(" - ")[1].strip()
+                cached = await r.get(f"result:{domain}")
+                if cached:
+                    found_results += 1
+                    # Ограничиваем вывод короткой версией
+                    lines = cached.split("\n")[:8]  # Первые 8 строк
+                    short_result = "\n".join(lines)
+                    if len(cached.split("\n")) > 8:
+                        short_result += "\n..."
+                    
+                    results_text += f"🔍 <b>{domain}:</b>\n{short_result}\n\n"
+                    
+                    # Ограничиваем количество результатов в одном сообщении
+                    if found_results >= 5:
+                        break
+        
+        if found_results == 0:
+            await message.answer("📜 Результаты ваших недавних проверок больше не доступны в кэше.")
+        else:
+            if len(results_text) > 4000:  # Ограничение Telegram
+                results_text = results_text[:3900] + "\n\n... (сообщение обрезано)"
+            
+            await message.answer(results_text)
+            
+        await log_analytics("all_results_requested", user_id, details=f"found={found_results}")
+        
+    except Exception as e:
+        logging.error(f"Failed to get all results for user {user_id}: {str(e)}")
+        await message.answer(f"❌ Ошибка при получении результатов: {str(e)}")
+    finally:
+        await r.aclose()
 
 async def handle_deep_link_full_report(message: types.Message, domain: str):
     """Обрабатывает запрос полного отчёта через deep link"""
@@ -634,8 +828,14 @@ async def analytics_command(message: types.Message):
         logging.warning(f"Non-admin user {user_id} attempted to access /analytics")
         return
         
-    if not ANALYTICS_AVAILABLE or not analytics_collector:
-        await message.reply("❌ Аналитика недоступна. Модуль не загружен.")
+    # Проверяем доступность модуля аналитики
+    if not ANALYTICS_AVAILABLE:
+        await message.reply("❌ Модуль аналитики недоступен. Проверьте зависимости (redis).")
+        return
+        
+    # Проверяем инициализацию коллектора
+    if not analytics_collector:
+        await message.reply("❌ Аналитика не инициализирована. Возможно, проблемы с подключением к Redis.\n\n💡 Проверьте:\n• Запущен ли Redis сервер\n• Правильность настроек подключения\n• Переменные окружения REDIS_HOST, REDIS_PORT")
         return
         
     try:
@@ -649,14 +849,18 @@ async def analytics_command(message: types.Message):
         
     except Exception as e:
         logging.error(f"Failed to generate analytics for user {user_id}: {str(e)}")
-        await message.reply(f"❌ Ошибка при генерации аналитики: {str(e)}")
+        await message.reply(f"❌ Ошибка при генерации аналитики: {str(e)}\n\n💡 Возможные причины:\n• Проблемы с подключением к Redis\n• Недостаток данных для отчета")
 
 @router.message(Command("groups"))
 async def groups_command(message: types.Message):
     """Команда для управления авторизованными группами (только для админа)"""
     user_id = message.from_user.id
+    
+    # Отладочная информация
+    logging.info(f"Groups command called by user {user_id}, ADMIN_ID={ADMIN_ID}")
+    
     if user_id != ADMIN_ID:
-        await message.reply("⛔ Эта команда доступна только администратору.")
+        await message.reply(f"⛔ Эта команда доступна только администратору.\n🐛 Отладка: ваш ID={user_id}, ADMIN_ID={ADMIN_ID}")
         logging.warning(f"Non-admin user {user_id} attempted to access /groups")
         return
     
@@ -1138,10 +1342,15 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                 await send_topic_aware_message(message, "❌ Не найдено валидных доменов. Укажите корректные домены, например: example.com")
             return
 
-        # Если доменов много и доступен BatchProcessor, используем его
-        if len(valid_domains) > 2 and PROGRESS_AVAILABLE:
+        # Для массовых запросов (более 1 домена) в группах - один ответ с кнопками
+        if len(valid_domains) > 1 and is_group_chat(message):
+            await handle_bulk_domains_in_group(message, valid_domains, user_id, short_mode)
+            return
+        
+        # Если доменов много и доступен BatchProcessor, используем его (только в ЛС)
+        if len(valid_domains) > 2 and PROGRESS_AVAILABLE and not is_group_chat(message):
             try:
-                batch_processor = BatchProcessor(bot, batch_size=3)
+                batch_processor = BatchProcessor(bot, batch_size=3, progress_update_delay=0.8)
                 
                 async def check_domain_wrapper(domain, user_id, short_mode):
                     """Обертка для проверки домена с логированием аналитики"""
@@ -1156,7 +1365,7 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                             await log_analytics("domain_check", user_id, 
                                               domain=domain, check_type="short" if short_mode else "full", 
                                               result_status="cached", execution_time=time() - start_time)
-                            return f"⚡ Результат из кэша для {domain}:\n\n{cached}"
+                            return f"✅ {domain} - результат из кэша"
                         
                         # Ставим в очередь с контекстом
                         chat_id = message.chat.id
@@ -1169,9 +1378,10 @@ async def handle_domain_logic(message: types.Message, input_text: str, inconclus
                             await log_analytics("domain_check", user_id,
                                               domain=domain, check_type="short" if short_mode else "full",
                                               result_status="queued", execution_time=time() - start_time)
-                            return f"✅ <b>{domain}</b> поставлен в очередь на {'краткий' if short_mode else 'полный'} отчёт."
+                            return f"✅ {domain} - поставлен в очередь"
                         else:
-                            return f"⚠️ <b>{domain}</b> уже в очереди на проверку."
+                            return f"⚠️ {domain} - уже в очереди"
+                            
                     except Exception as e:
                         await log_analytics("domain_check", user_id,
                                           domain=domain, check_type="short" if short_mode else "full",
@@ -1287,5 +1497,4 @@ async def main():
 
 if __name__ == "__main__":
     logging.info("Starting bot script")
-    asyncio.run(main())
     asyncio.run(main())

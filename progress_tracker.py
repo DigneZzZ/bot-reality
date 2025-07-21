@@ -8,7 +8,7 @@ import logging
 class ProgressTracker:
     """Отслеживает прогресс для множественных проверок доменов"""
     
-    def __init__(self, bot: Bot, message: Message, total_domains: int):
+    def __init__(self, bot: Bot, message: Message, total_domains: int, update_delay: float = 0.8):
         self.bot = bot
         self.message = message
         self.total_domains = total_domains
@@ -17,6 +17,8 @@ class ProgressTracker:
         self.start_time = datetime.now()
         self.progress_message: Optional[Message] = None
         self.domain_results: Dict[str, str] = {}
+        self.update_delay = update_delay  # Пауза между обновлениями прогресс-бара
+        self.last_update_time = 0.0  # Время последнего обновления
         
     async def start(self, domains: List[str]) -> None:
         """Инициализирует progress bar"""
@@ -56,6 +58,17 @@ class ProgressTracker:
             except Exception as e:
                 logging.error(f"Failed to update final progress message: {e}")
     
+    async def _force_update_progress_message(self) -> None:
+        """Принудительно обновляет сообщение с прогрессом без задержки"""
+        if not self.progress_message:
+            return
+            
+        try:
+            new_text = self._generate_progress_text()
+            await self.progress_message.edit_text(new_text)
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                logging.warning(f"Failed to force update progress message: {e}")
     def _generate_progress_text(self, domains: Optional[List[str]] = None) -> str:
         """Генерирует текст progress bar"""
         progress_percentage = (self.completed / self.total_domains) * 100 if self.total_domains > 0 else 0
@@ -88,13 +101,23 @@ class ProgressTracker:
         return text
     
     async def _update_progress_message(self) -> None:
-        """Обновляет сообщение с прогрессом"""
+        """Обновляет сообщение с прогрессом с учетом задержки для читаемости"""
         if not self.progress_message:
+            return
+        
+        # Проверяем, прошло ли достаточно времени с последнего обновления
+        current_time = (datetime.now() - self.start_time).total_seconds()
+        if current_time - self.last_update_time < self.update_delay:
             return
             
         try:
             new_text = self._generate_progress_text()
             await self.progress_message.edit_text(new_text)
+            self.last_update_time = current_time
+            
+            # Добавляем паузу для лучшей читаемости
+            await asyncio.sleep(self.update_delay)
+            
         except Exception as e:
             # Telegram может ограничивать частоту обновлений
             if "message is not modified" not in str(e).lower():
@@ -103,10 +126,11 @@ class ProgressTracker:
 class BatchProcessor:
     """Обрабатывает домены батчами с прогрессом"""
     
-    def __init__(self, bot: Bot, batch_size: int = 3, delay_between_batches: float = 1.0):
+    def __init__(self, bot: Bot, batch_size: int = 3, delay_between_batches: float = 1.0, progress_update_delay: float = 0.8):
         self.bot = bot
         self.batch_size = batch_size
         self.delay_between_batches = delay_between_batches
+        self.progress_update_delay = progress_update_delay  # Задержка для обновления прогресс-бара
     
     async def process_domains(
         self,
@@ -130,7 +154,7 @@ class BatchProcessor:
             Словарь с результатами
         """
         total_domains = len(domains)
-        tracker = ProgressTracker(self.bot, message, total_domains)
+        tracker = ProgressTracker(self.bot, message, total_domains, update_delay=self.progress_update_delay)
         
         await tracker.start(domains)
         
