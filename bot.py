@@ -277,14 +277,19 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
 
         for domain in valid_domains:
             try:
-                cached_result = await r.get(f"result:{domain}")
-                if cached_result and (not final_short_mode or "краткий" in cached_result.lower()):
-                    # Для групп добавляем инструкцию о полном отчете, если режим короткий
+                # Формируем ключ кэша с учетом режима вывода
+                cache_mode = "short" if final_short_mode else "full"
+                cache_key = f"result:{domain}:{cache_mode}"
+                cached_result = await r.get(cache_key)
+                
+                if cached_result:
+                    # Результат найден в кэше с нужным типом отчета
                     response_text = cached_result
-                    if is_group and GROUP_OUTPUT_MODE == "short":
-                        response_text += "\n\n💡 <i>Для полного логирования выполните повторный запрос в ЛС боту.</i>"
+                    if is_group and final_short_mode:
+                        response_text += "\n\n💡 <i>Для полного отчета выполните повторный запрос в ЛС боту.</i>"
                     await send_topic_aware_message(message, response_text)
                 else:
+                    # Результата нет в кэше или нужен другой тип отчета
                     await enqueue(domain, user_id, final_short_mode, message.chat.id, message.message_id, message.message_thread_id)
                     await send_topic_aware_message(message, f"✅ Домен <b>{domain}</b> добавлен в очередь на проверку.")
                 await log_analytics("domain_check", user_id, domain=domain, mode="short" if final_short_mode else "full")

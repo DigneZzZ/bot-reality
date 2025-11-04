@@ -128,8 +128,12 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
     # Сохраняем результат
     r = await get_redis()
     try:
-        # Сохраняем полный отчет в кэш на 7 дней (вместо 24 часов)
-        await r.set(f"result:{domain}", report, ex=604800)
+        # Определяем режим для ключа кэша
+        cache_mode = "short" if short_mode else "full"
+        cache_key = f"result:{domain}:{cache_mode}"
+        
+        # Сохраняем отчет с учетом режима на 7 дней
+        await r.set(cache_key, report, ex=604800)
 
         # Проверяем пригодность домена и добавляем в approved_domains (только если включена опция)
         if SAVE_APPROVED_DOMAINS and "✅ Пригоден для Reality" in report:
