@@ -597,22 +597,32 @@ def get_admin_keyboard():
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_domain_result_keyboard(domain: str, is_short: bool):
+def get_domain_result_keyboard(domain: str, is_short: bool, lang: str = 'ru'):
     """Генерирует клавиатуру для результата проверки домена"""
+    # Локализация текста кнопок
+    if lang == 'en':
+        full_report_text = "📄 Full Report"
+        short_report_text = "📋 Short Report"
+        recheck_text = "🔄 Recheck"
+    else:  # ru
+        full_report_text = "📄 Полный отчет"
+        short_report_text = "📋 Краткий отчет"
+        recheck_text = "🔄 Перепроверить"
+    
     buttons = []
     if is_short:
         buttons.append([InlineKeyboardButton(
-            text="📄 Полный отчет", 
+            text=full_report_text, 
             callback_data=f"full_report:{domain}"
         )])
     else:
         buttons.append([InlineKeyboardButton(
-            text="📋 Краткий отчет", 
+            text=short_report_text, 
             callback_data=f"short_report:{domain}"
         )])
     
     buttons.append([InlineKeyboardButton(
-        text="🔄 Перепроверить", 
+        text=recheck_text, 
         callback_data=f"recheck:{domain}:{int(is_short)}"
     )])
     
@@ -703,7 +713,7 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
                         response_text += "\n\n💡 <i>Для полного отчета выполните повторный запрос в ЛС боту.</i>"
                     
                     # Добавляем inline кнопки только для личных сообщений
-                    keyboard = get_domain_result_keyboard(domain, final_short_mode) if not is_group else None
+                    keyboard = get_domain_result_keyboard(domain, final_short_mode, lang=user_lang) if not is_group else None
                     await send_topic_aware_message(message, response_text, reply_markup=keyboard)
                 else:
                     # Результата нет в кэше или нужен другой тип отчета
@@ -1258,7 +1268,7 @@ async def cq_full_report(call: CallbackQuery):
         
         if cached_result:
             # Полный отчет найден в кэше
-            keyboard = get_domain_result_keyboard(domain, is_short=False)
+            keyboard = get_domain_result_keyboard(domain, is_short=False, lang=user_lang)
             await call.message.edit_text(cached_result, reply_markup=keyboard)
         else:
             # Нет в кэше, добавляем в очередь
@@ -1283,7 +1293,7 @@ async def cq_short_report(call: CallbackQuery):
         
         if cached_result:
             # Краткий отчет найден в кэше
-            keyboard = get_domain_result_keyboard(domain, is_short=True)
+            keyboard = get_domain_result_keyboard(domain, is_short=True, lang=user_lang)
             await call.message.edit_text(cached_result, reply_markup=keyboard)
         else:
             # Нет в кэше, добавляем в очередь

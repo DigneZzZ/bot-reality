@@ -46,22 +46,32 @@ bot = Bot(token=TOKEN, parse_mode="HTML")
 # Инициализация аналитики
 analytics_collector = None
 
-def get_domain_result_keyboard(domain: str, is_short: bool):
+def get_domain_result_keyboard(domain: str, is_short: bool, lang: str = 'ru'):
     """Генерирует inline клавиатуру для результата проверки домена"""
+    # Локализация текста кнопок
+    if lang == 'en':
+        full_report_text = "📄 Full Report"
+        short_report_text = "📋 Short Report"
+        recheck_text = "🔄 Recheck"
+    else:  # ru
+        full_report_text = "📄 Полный отчет"
+        short_report_text = "📋 Краткий отчет"
+        recheck_text = "🔄 Перепроверить"
+    
     buttons = []
     if is_short:
         buttons.append([InlineKeyboardButton(
-            text="📄 Полный отчет", 
+            text=full_report_text, 
             callback_data=f"full_report:{domain}"
         )])
     else:
         buttons.append([InlineKeyboardButton(
-            text="📋 Краткий отчет", 
+            text=short_report_text, 
             callback_data=f"short_report:{domain}"
         )])
     
     buttons.append([InlineKeyboardButton(
-        text="🔄 Перепроверить", 
+        text=recheck_text, 
         callback_data=f"recheck:{domain}:{int(is_short)}"
     )])
     
@@ -282,15 +292,16 @@ async def worker():
                     if is_group:
                         # В группе используем GROUP_OUTPUT_MODE
                         if GROUP_OUTPUT_MODE == "short":
-                            # Краткий отчёт с инструкцией о ЛС
-                            group_message = result + "\n\n💡 <i>Для полного логирования выполните повторный запрос в ЛС боту.</i>"
+                            # Краткий отчёт с инструкцией о ЛС (локализованное сообщение)
+                            pm_hint = "\n\n💡 <i>Для полного логирования выполните повторный запрос в ЛС боту.</i>" if lang == 'ru' else "\n\n💡 <i>For full logging, repeat the request in PM to the bot.</i>"
+                            group_message = result + pm_hint
                             await send_group_reply(chat_id, message_id, thread_id, group_message)
                         else:
                             # Полный отчёт в группе
                             await send_group_reply(chat_id, message_id, thread_id, result)
                     else:
                         # В ЛС отправляем с inline кнопками
-                        keyboard = get_domain_result_keyboard(domain, is_short=short_mode)
+                        keyboard = get_domain_result_keyboard(domain, is_short=short_mode, lang=lang)
                         await bot.send_message(user_id, result, reply_markup=keyboard)
                 except Exception as e:
                     logging.error(f"Failed to send message to chat {chat_id} for {domain}: {str(e)}")
