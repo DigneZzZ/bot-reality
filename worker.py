@@ -93,7 +93,7 @@ async def log_analytics(action: str, user_id: int, **kwargs):
         except Exception as e:
             logging.warning(f"Failed to log worker analytics: {e}")
 
-async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
+async def check_domain(domain: str, user_id: int, short_mode: bool, lang: str = 'ru') -> str:
     """Проверяет домен с retry логикой и аналитикой"""
     start_time = datetime.now()
     
@@ -104,11 +104,12 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
             async with asyncio.timeout(300):
                 # run_check не асинхронна, поэтому запускаем её в потоке
                 loop = asyncio.get_event_loop()
-                report = await loop.run_in_executor(None, lambda: run_check(domain, full_report=not short_mode))
+                report = await loop.run_in_executor(None, lambda: run_check(domain, full_report=not short_mode, lang=lang))
                 return report
         except asyncio.TimeoutError:
             logging.error(f"Timeout while checking {domain} for user {user_id}")
-            raise asyncio.TimeoutError(f"Проверка {domain} прервана: превышено время ожидания (5 минут).")
+            error_msg = f"Проверка {domain} прервана: превышено время ожидания (5 минут)." if lang == 'ru' else f"Check {domain} timed out (5 minutes)."
+            raise asyncio.TimeoutError(error_msg)
     
     try:
         # Используем retry логику если доступна
@@ -144,8 +145,9 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
             await r.delete(f"pending:{domain}:{user_id}")
         finally:
             await r.aclose()
-            
-        return f"❌ Ошибка при проверке {domain}: {str(e)}"
+        
+        error_msg = f"❌ Ошибка при проверке {domain}: {str(e)}" if lang == 'ru' else f"❌ Error checking {domain}: {str(e)}"
+        return error_msg
 
     # Сохраняем результат
     r = await get_redis()
@@ -158,7 +160,9 @@ async def check_domain(domain: str, user_id: int, short_mode: bool) -> str:
         await r.set(cache_key, report, ex=604800)
 
         # Проверяем пригодность домена и добавляем в approved_domains (только если включена опция)
-        if SAVE_APPROVED_DOMAINS and "✅ Пригоден для Reality" in report:
+        # Поддержка обоих языков
+        suitable_markers = ["✅ Пригоден для Reality", "✅ Suitable for Reality"]
+        if SAVE_APPROVED_DOMAINS and any(marker in report for marker in suitable_markers):
             await r.sadd("approved_domains", domain)
 
         output = report  # Используем отчет напрямую из run_check
@@ -268,8 +272,8 @@ async def worker():
                     thread_id = None
                     lang = 'ru'  # По умолчанию русский для старого формата
                 
-                # TODO: В будущем передавать lang в check_domain для локализации результатов проверки
-                result = await check_domain(domain, user_id, short_mode)
+                # Передаём lang в check_domain для локализации результатов проверки
+                result = await check_domain(domain, user_id, short_mode, lang)
                 
                 try:
                     # Определяем, это групповой чат или ЛС
