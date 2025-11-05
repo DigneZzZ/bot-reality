@@ -262,6 +262,101 @@ def is_valid_ipv4(ip_str: str) -> bool:
     except (ValueError, ipaddress.AddressValueError):
         return False
 
+async def get_ip_whois_info(ip_address: str, lang: str = 'ru') -> str:
+    """
+    Получение WHOIS информации об IP адресе из региональных реестров
+    
+    Args:
+        ip_address: IPv4 адрес для проверки
+        lang: Язык вывода
+    
+    Returns:
+        Форматированная строка с WHOIS данными или пустая строка
+    """
+    try:
+        import aiohttp
+        
+        async with aiohttp.ClientSession() as session:
+            # Пробуем RIPE API (Европа, Ближний Восток, Центральная Азия)
+            url = f"https://stat.ripe.net/data/whois/data.json?resource={ip_address}"
+            
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        if data.get('status') == 'ok' and data.get('data', {}).get('records'):
+                            records = data['data']['records']
+                            
+                            # Извлекаем информацию
+                            whois_info = {}
+                            for record_group in records:
+                                for record in record_group:
+                                    key = record.get('key', '').lower()
+                                    value = record.get('value', '')
+                                    
+                                    if key == 'netname' and 'netname' not in whois_info:
+                                        whois_info['netname'] = value
+                                    elif key == 'country' and 'country' not in whois_info:
+                                        whois_info['country'] = value
+                                    elif key == 'status' and 'status' not in whois_info:
+                                        whois_info['status'] = value
+                                    elif key == 'descr' and 'descr' not in whois_info:
+                                        whois_info['descr'] = value
+                                    elif key == 'inetnum' and 'inetnum' not in whois_info:
+                                        whois_info['inetnum'] = value
+                                    elif (key == 'orgname' or key == 'org-name') and 'orgname' not in whois_info:
+                                        whois_info['orgname'] = value
+                            
+                            if whois_info:
+                                rir = "RIPE NCC"
+                                rir_flag = "🇪🇺"
+                                
+                                lines = []
+                                lines.append(f"\n📋 {rir_flag} <b>{rir}</b> {'данные' if lang == 'ru' else 'data'}:")
+                                
+                                if 'inetnum' in whois_info:
+                                    lines.append(f"🌐 {'Диапазон' if lang == 'ru' else 'Range'}: {whois_info['inetnum']}")
+                                
+                                if 'netname' in whois_info:
+                                    lines.append(f"🏷 {'Сеть' if lang == 'ru' else 'Network'}: {whois_info['netname']}")
+                                
+                                if 'orgname' in whois_info:
+                                    lines.append(f"🏢 {'Организация' if lang == 'ru' else 'Organization'}: {whois_info['orgname']}")
+                                elif 'descr' in whois_info:
+                                    lines.append(f"📝 {'Описание' if lang == 'ru' else 'Description'}: {whois_info['descr']}")
+                                
+                                if 'country' in whois_info:
+                                    country_flags = {
+                                        'PL': '🇵🇱', 'DE': '🇩🇪', 'US': '🇺🇸', 'GB': '🇬🇧', 
+                                        'FR': '🇫🇷', 'NL': '🇳🇱', 'RU': '🇷🇺', 'UA': '🇺🇦',
+                                        'IT': '🇮🇹', 'ES': '🇪🇸', 'SE': '🇸🇪', 'NO': '🇳🇴',
+                                        'FI': '🇫🇮', 'DK': '🇩🇰', 'CH': '🇨🇭', 'AT': '🇦🇹',
+                                        'BE': '🇧🇪', 'CZ': '🇨🇿', 'IE': '🇮🇪', 'PT': '🇵🇹',
+                                    }
+                                    country_flag = country_flags.get(whois_info['country'], '🏳️')
+                                    lines.append(f"{country_flag} {'Страна' if lang == 'ru' else 'Country'}: {whois_info['country']}")
+                                
+                                if 'status' in whois_info:
+                                    lines.append(f"📊 {'Статус' if lang == 'ru' else 'Status'}: {whois_info['status']}")
+                                
+                                # Добавляем регион покрытия RIPE
+                                if lang == 'ru':
+                                    lines.append(f"🌍 {'Регион RIR'}: Европа, Ближний Восток, Центральная Азия")
+                                else:
+                                    lines.append(f"🌍 RIR Region: Europe, Middle East, Central Asia")
+                                
+                                return "\n".join(lines)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                logging.debug(f"RIPE lookup failed for {ip_address}: {e}")
+        
+    except Exception as e:
+        logging.warning(f"Failed to get WHOIS data for {ip_address}: {e}")
+    
+    return ""
+
 async def get_ip_info(ip_address: str, lang: str = 'ru') -> str:
     """
     Получение информации об IP адресе из GeoIP2 базы данных.
@@ -428,6 +523,11 @@ async def get_ip_info(ip_address: str, lang: str = 'ru') -> str:
                     # Сателлитный провайдер
                     if hasattr(traits, 'is_satellite_provider') and traits.is_satellite_provider:
                         lines.append(f"🛰 {i18n.get('ip.satellite', lang) if i18n.is_supported(lang) else 'Satellite provider'}: {'Yes' if lang == 'en' else 'Да'}")
+                
+                # Получаем WHOIS информацию
+                whois_data = await get_ip_whois_info(ip_address, lang)
+                if whois_data:
+                    lines.append(whois_data)
                 
                 return "\n".join(lines)
                 
