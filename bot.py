@@ -668,33 +668,40 @@ async def cmd_start(message: Message, command: Optional[CommandObject] = None):
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     if not message.from_user: return
-    is_admin = message.from_user.id == ADMIN_ID
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
     is_group = is_group_chat(message)
+    
+    # Получаем язык пользователя
+    user_lang = await get_user_language(user_id)
     
     if is_group:
         # Команды для групповых чатов
         help_text = (
-            "<b>Команды для групп:</b>\n"
-            "/start - Начало работы\n"
-            "/help - Показать эту справку\n"
-            "/check [домен] - Краткая проверка\n"
-            "/full [домен] - Полная проверка\n\n"
-            f"<i>💡 Префикс команд: {GROUP_COMMAND_PREFIX}</i>\n"
-            f"<i>📊 Режим вывода: {GROUP_OUTPUT_MODE}</i>"
+            f"<b>{_('help.group_title', lang=user_lang)}</b>\n"
+            f"/start - {_('commands.start', lang=user_lang)}\n"
+            f"/help - {_('commands.help', lang=user_lang)}\n"
+            f"/check [{'domain' if user_lang == 'en' else 'домен'}] - {_('commands.check', lang=user_lang)}\n"
+            f"/full [{'domain' if user_lang == 'en' else 'домен'}] - {_('commands.full', lang=user_lang)}\n"
+            f"/ip [IP] - {_('commands.ip', lang=user_lang)}\n\n"
+            f"{_('help.prefix_info', lang=user_lang, prefix=GROUP_COMMAND_PREFIX)}\n"
+            f"{_('help.output_mode', lang=user_lang, mode=GROUP_OUTPUT_MODE)}"
         )
     else:
         # Команды для личных сообщений
         help_text = (
-            "<b>Основные команды:</b>\n"
-            "/start - Начало работы\n"
-            "/help - Показать эту справку\n"
-            "/mode - Сменить режим вывода\n"
-            "/history - Последние 10 проверок\n"
-            "/check [домен] - Краткая проверка\n"
-            "/full [домен] - Полная проверка\n"
+            f"<b>{_('help.basic_title', lang=user_lang)}</b>\n"
+            f"/start - {_('commands.start', lang=user_lang)}\n"
+            f"/help - {_('commands.help', lang=user_lang)}\n"
+            f"/mode - {_('commands.mode', lang=user_lang)}\n"
+            f"/history - {_('commands.history', lang=user_lang)}\n"
+            f"/check [{'domain' if user_lang == 'en' else 'домен'}] - {_('commands.check', lang=user_lang)}\n"
+            f"/full [{'domain' if user_lang == 'en' else 'домен'}] - {_('commands.full', lang=user_lang)}\n"
+            f"/ip [IP] - {_('commands.ip', lang=user_lang)}\n"
+            f"/language - {_('commands.language', lang=user_lang)}\n"
         )
         if is_admin:
-            help_text += "\n<b>Админ-команды:</b> /admin"
+            help_text += f"\n<b>{_('help.admin_title', lang=user_lang)}</b> /admin"
     
     await send_topic_aware_message(message, help_text)
 
