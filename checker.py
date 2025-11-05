@@ -311,8 +311,21 @@ def resolve_dns(domain: str, timeout: int = DEFAULT_DNS_TIMEOUT) -> Optional[str
         resolver.lifetime = timeout
         answers = resolver.resolve(domain, 'A')
         return str(answers[0])
+    except dns.resolver.NXDOMAIN:
+        # Домен не существует - это нормальная ситуация, не ошибка
+        checker_logger.debug(f"Domain {domain} does not exist (NXDOMAIN)")
+        return None
+    except dns.resolver.NoAnswer:
+        # DNS ответ не содержит A-записи - тоже нормальная ситуация
+        checker_logger.debug(f"Domain {domain} has no A records")
+        return None
+    except dns.resolver.Timeout:
+        # Тайм-аут DNS запроса
+        checker_logger.warning(f"DNS timeout for {domain}")
+        return None
     except Exception as e:
-        checker_logger.error(f"DNS resolution failed for {domain}: {str(e)}")
+        # Только реальные ошибки логируем как ERROR
+        checker_logger.error(f"DNS resolution error for {domain}: {str(e)}")
         return None
 
 
