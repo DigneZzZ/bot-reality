@@ -321,68 +321,113 @@ async def get_ip_info(ip_address: str, lang: str = 'ru') -> str:
                 # Формируем информацию
                 ip_emoji = "🌐"
                 country_emoji = "🌍"
+                region_emoji = "📍"
                 city_emoji = "🏙️"
-                isp_emoji = "🔌"
-                coord_emoji = "📍"
+                postal_emoji = "�"
+                timezone_emoji = "�"
+                coord_emoji = "🗺"
+                accuracy_emoji = "🎯"
                 
-                # Получаем название страны на нужном языке
-                country = None
-                country_iso = None
+                lines = [i18n.get('ip.title', lang), ""]
+                lines.append(f"{ip_emoji} {i18n.get('ip.address', lang)}: `{ip_address}`")
+                
+                # Континент
+                if response.continent and response.continent.names:
+                    continent = response.continent.names.get(lang, response.continent.names.get('en', ''))
+                    if continent:
+                        lines.append(f"🌏 {i18n.get('ip.continent', lang) if i18n.is_supported(lang) else 'Continent'}: {continent}")
+                
+                # Страна
                 if response.country and response.country.names:
                     country_names = response.country.names
-                    if lang == 'ru' and 'ru' in country_names:
-                        country = country_names['ru']
-                    elif lang == 'en' and 'en' in country_names:
-                        country = country_names['en']
-                    else:
-                        country = country_names.get('en')
-                    country_iso = response.country.iso_code
+                    country = country_names.get(lang, country_names.get('en', i18n.get('ip.unknown', lang)))
+                    country_iso = response.country.iso_code or i18n.get('ip.unknown', lang)
+                    lines.append(f"{country_emoji} {i18n.get('ip.country', lang)}: {country} ({country_iso})")
+                else:
+                    lines.append(f"{country_emoji} {i18n.get('ip.country', lang)}: {i18n.get('ip.unknown', lang)}")
                 
-                if not country:
-                    country = i18n.get('ip.unknown', lang)
-                if not country_iso:
-                    country_iso = i18n.get('ip.unknown', lang)
+                # Регион/Область
+                if response.subdivisions and len(response.subdivisions) > 0:
+                    subdivision = response.subdivisions[0]
+                    if subdivision.names:
+                        region_name = subdivision.names.get(lang, subdivision.names.get('en', ''))
+                        region_code = subdivision.iso_code or ''
+                        if region_name:
+                            region_text = f"{region_name}"
+                            if region_code:
+                                region_text += f" ({region_code})"
+                            lines.append(f"{region_emoji} {i18n.get('ip.region', lang) if i18n.is_supported(lang) else 'Region'}: {region_text}")
                 
-                # Получаем название города
-                city = None
+                # Город
                 if response.city and response.city.names:
                     city_names = response.city.names
-                    if lang == 'ru' and 'ru' in city_names:
-                        city = city_names['ru']
-                    elif lang == 'en' and 'en' in city_names:
-                        city = city_names['en']
-                    else:
-                        city = city_names.get('en')
+                    city = city_names.get(lang, city_names.get('en', ''))
+                    if city:
+                        lines.append(f"{city_emoji} {i18n.get('ip.city', lang)}: {city}")
+                
+                # Почтовый индекс
+                if response.postal and response.postal.code:
+                    lines.append(f"{postal_emoji} {i18n.get('ip.postal', lang) if i18n.is_supported(lang) else 'Postal code'}: {response.postal.code}")
                 
                 # Координаты
-                lat = response.location.latitude
-                lon = response.location.longitude
+                if response.location:
+                    lat = response.location.latitude
+                    lon = response.location.longitude
+                    if lat is not None and lon is not None:
+                        lines.append(f"{coord_emoji} {i18n.get('ip.coordinates', lang)}: {lat:.4f}, {lon:.4f}")
+                        
+                    # Точность определения
+                    if response.location.accuracy_radius:
+                        lines.append(f"{accuracy_emoji} {i18n.get('ip.accuracy', lang) if i18n.is_supported(lang) else 'Accuracy'}: ±{response.location.accuracy_radius} км")
+                    
+                    # Временная зона
+                    if response.location.time_zone:
+                        lines.append(f"{timezone_emoji} {i18n.get('ip.timezone', lang) if i18n.is_supported(lang) else 'Timezone'}: {response.location.time_zone}")
                 
-                # Формируем ответ
-                lines = [
-                    i18n.get('ip.title', lang),
-                    "",
-                    f"{ip_emoji} {i18n.get('ip.address', lang)}: `{ip_address}`",
-                    f"{country_emoji} {i18n.get('ip.country', lang)}: {country} ({country_iso})",
-                ]
+                # Зарегистрированная страна (если отличается)
+                if response.registered_country and response.registered_country.iso_code:
+                    if not response.country or response.registered_country.iso_code != response.country.iso_code:
+                        reg_country_names = response.registered_country.names
+                        reg_country = reg_country_names.get(lang, reg_country_names.get('en', ''))
+                        if reg_country:
+                            lines.append(f"📋 {i18n.get('ip.registered_country', lang) if i18n.is_supported(lang) else 'Registered country'}: {reg_country} ({response.registered_country.iso_code})")
                 
-                if city:
-                    lines.append(f"{city_emoji} {i18n.get('ip.city', lang)}: {city}")
-                
-                # ISP/Organization (если доступно в базе)
-                # В City базе может не быть ISP, это есть в ASN базе
-                # Но попробуем получить
-                try:
-                    if hasattr(response, 'traits') and hasattr(response.traits, 'isp'):
-                        isp = response.traits.isp
-                        if isp:
-                            lines.append(f"{isp_emoji} {i18n.get('ip.provider', lang)}: {isp}")
-                except:
-                    pass
-                
-                # Координаты
-                if lat is not None and lon is not None:
-                    lines.append(f"{coord_emoji} {i18n.get('ip.coordinates', lang)}: {lat:.4f}, {lon:.4f}")
+                # Автономная система (AS)
+                if hasattr(response, 'traits'):
+                    traits = response.traits
+                    
+                    # ASN
+                    if hasattr(traits, 'autonomous_system_number') and traits.autonomous_system_number:
+                        asn = traits.autonomous_system_number
+                        as_org = getattr(traits, 'autonomous_system_organization', '')
+                        if as_org:
+                            lines.append(f"🔢 ASN: AS{asn} ({as_org})")
+                        else:
+                            lines.append(f"🔢 ASN: AS{asn}")
+                    
+                    # ISP/Организация
+                    if hasattr(traits, 'isp') and traits.isp:
+                        lines.append(f"🏢 ISP: {traits.isp}")
+                    
+                    if hasattr(traits, 'organization') and traits.organization:
+                        if not hasattr(traits, 'isp') or traits.organization != traits.isp:
+                            lines.append(f"🏛 {i18n.get('ip.organization', lang)}: {traits.organization}")
+                    
+                    # Тип подключения
+                    if hasattr(traits, 'connection_type') and traits.connection_type:
+                        lines.append(f"📡 {i18n.get('ip.connection_type', lang) if i18n.is_supported(lang) else 'Connection'}: {traits.connection_type}")
+                    
+                    # Домен
+                    if hasattr(traits, 'domain') and traits.domain:
+                        lines.append(f"🌐 Domain: {traits.domain}")
+                    
+                    # Анонимный прокси
+                    if hasattr(traits, 'is_anonymous_proxy') and traits.is_anonymous_proxy:
+                        lines.append(f"⚠️ {i18n.get('ip.anonymous_proxy', lang) if i18n.is_supported(lang) else 'Anonymous proxy'}: {'Yes' if lang == 'en' else 'Да'}")
+                    
+                    # Сателлитный провайдер
+                    if hasattr(traits, 'is_satellite_provider') and traits.is_satellite_provider:
+                        lines.append(f"🛰 {i18n.get('ip.satellite', lang) if i18n.is_supported(lang) else 'Satellite provider'}: {'Yes' if lang == 'en' else 'Да'}")
                 
                 return "\n".join(lines)
                 
