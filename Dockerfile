@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y curl cron && apt-get clean
 
 # Копируем все файлы проекта
 COPY bot.py worker.py checker.py redis_queue.py progress_tracker.py analytics.py retry_logic.py cleanup_logs.sh ./
-COPY geoip2_updater.py geoip2_integration.py ./
+COPY geoip2_updater.py geoip2_integration.py localization.py ./
+COPY locales/ ./locales/
 
 # Делаем скрипты исполняемыми
 RUN chmod +x cleanup_logs.sh
