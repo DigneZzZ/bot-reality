@@ -273,6 +273,36 @@ async def get_ip_info(ip_address: str, lang: str = 'ru') -> str:
     Returns:
         Форматированная строка с информацией об IP адресе
     """
+    # Известные публичные IP адреса
+    known_ips = {
+        "1.1.1.1": {"name": "Cloudflare DNS", "org": "Cloudflare, Inc.", "country": "US", "city": "San Francisco"},
+        "8.8.8.8": {"name": "Google Public DNS", "org": "Google LLC", "country": "US", "city": "Mountain View"},
+        "8.8.4.4": {"name": "Google Public DNS", "org": "Google LLC", "country": "US", "city": "Mountain View"},
+        "1.0.0.1": {"name": "Cloudflare DNS", "org": "Cloudflare, Inc.", "country": "US", "city": "San Francisco"},
+        "208.67.222.222": {"name": "OpenDNS", "org": "Cisco OpenDNS", "country": "US", "city": "San Francisco"},
+        "208.67.220.220": {"name": "OpenDNS", "org": "Cisco OpenDNS", "country": "US", "city": "San Francisco"},
+    }
+    
+    # Проверяем, является ли IP известным публичным сервисом
+    if ip_address in known_ips:
+        info = known_ips[ip_address]
+        ip_emoji = "🌐"
+        country_emoji = "🌍"
+        city_emoji = "🏙️"
+        org_emoji = "🏢"
+        service_emoji = "⚡"
+        
+        lines = [
+            i18n.get('ip.title', lang),
+            "",
+            f"{ip_emoji} {i18n.get('ip.address', lang)}: `{ip_address}`",
+            f"{service_emoji} {i18n.get('ip.service', lang) if i18n.is_supported(lang) else 'Service'}: {info['name']}",
+            f"{org_emoji} {i18n.get('ip.organization', lang) if i18n.is_supported(lang) else 'Organization'}: {info['org']}",
+            f"{country_emoji} {i18n.get('ip.country', lang)}: {info['country']}",
+            f"{city_emoji} {i18n.get('ip.city', lang)}: {info['city']}",
+        ]
+        return "\n".join(lines)
+    
     try:
         import geoip2.database
         import geoip2.errors
@@ -296,25 +326,33 @@ async def get_ip_info(ip_address: str, lang: str = 'ru') -> str:
                 coord_emoji = "📍"
                 
                 # Получаем название страны на нужном языке
-                country_names = response.country.names
-                if lang == 'ru' and 'ru' in country_names:
-                    country = country_names['ru']
-                elif lang == 'en' and 'en' in country_names:
-                    country = country_names['en']
-                else:
-                    country = country_names.get('en', i18n.get('ip.unknown', lang))
+                country = None
+                country_iso = None
+                if response.country and response.country.names:
+                    country_names = response.country.names
+                    if lang == 'ru' and 'ru' in country_names:
+                        country = country_names['ru']
+                    elif lang == 'en' and 'en' in country_names:
+                        country = country_names['en']
+                    else:
+                        country = country_names.get('en')
+                    country_iso = response.country.iso_code
+                
+                if not country:
+                    country = i18n.get('ip.unknown', lang)
+                if not country_iso:
+                    country_iso = i18n.get('ip.unknown', lang)
                 
                 # Получаем название города
-                city_names = response.city.names
-                if lang == 'ru' and 'ru' in city_names:
-                    city = city_names['ru']
-                elif lang == 'en' and 'en' in city_names:
-                    city = city_names['en']
-                else:
-                    city = city_names.get('en', i18n.get('ip.unknown', lang))
-                
-                # ISO код страны
-                country_iso = response.country.iso_code or i18n.get('ip.unknown', lang)
+                city = None
+                if response.city and response.city.names:
+                    city_names = response.city.names
+                    if lang == 'ru' and 'ru' in city_names:
+                        city = city_names['ru']
+                    elif lang == 'en' and 'en' in city_names:
+                        city = city_names['en']
+                    else:
+                        city = city_names.get('en')
                 
                 # Координаты
                 lat = response.location.latitude
@@ -387,10 +425,19 @@ async def delete_message_after_delay(chat_id: int, message_id: int, delay: int =
 
 # --- Keyboards ---
 def get_main_keyboard(is_admin: bool, lang: str = 'ru'):
+    # Определяем текст кнопки смены языка на альтернативном языке
+    if lang == 'ru':
+        lang_button_text = "🌐 English"
+    elif lang == 'en':
+        lang_button_text = "🌐 Русский"
+    else:
+        lang_button_text = "🌐 Language"
+    
     buttons = [
         [InlineKeyboardButton(text=_("buttons.mode", lang=lang), callback_data="mode")],
         [InlineKeyboardButton(text=_("buttons.history", lang=lang), callback_data="history")],
-        [InlineKeyboardButton(text=_("buttons.language", lang=lang), callback_data="change_language")]
+        [InlineKeyboardButton(text=_("buttons.help", lang=lang), callback_data="help")],
+        [InlineKeyboardButton(text=lang_button_text, callback_data="change_language")]
     ]
     if is_admin:
         buttons.append([InlineKeyboardButton(text=_("buttons.admin_panel", lang=lang), callback_data="admin_panel")])
@@ -909,6 +956,35 @@ async def cq_history(call: CallbackQuery):
         ]))
     finally:
         await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data == "help")
+async def cq_help(call: CallbackQuery):
+    """Обработчик кнопки справки"""
+    if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
+    
+    user_id = call.from_user.id
+    user_lang = await get_user_language(user_id)
+    is_admin = user_id == ADMIN_ID
+    
+    # Команды для личных сообщений
+    help_text = (
+        f"<b>{_('help.basic_title', lang=user_lang)}</b>\n"
+        f"/start - {_('commands.start', lang=user_lang)}\n"
+        f"/help - {_('commands.help', lang=user_lang)}\n"
+        f"/mode - {_('commands.mode', lang=user_lang)}\n"
+        f"/history - {_('commands.history', lang=user_lang)}\n"
+        f"/check [домен] - {_('commands.check', lang=user_lang)}\n"
+        f"/full [домен] - {_('commands.full', lang=user_lang)}\n"
+        f"/ip [IP] - {_('commands.ip', lang=user_lang)}\n"
+        f"/language - {_('commands.language', lang=user_lang)}\n"
+    )
+    if is_admin:
+        help_text += f"\n<b>{_('help.admin_title', lang=user_lang)}</b> /admin"
+    
+    await call.message.edit_text(help_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=_("buttons.back", lang=user_lang), callback_data="start_menu")]
+    ]))
     await call.answer()
 
 @router.callback_query(F.data == "admin_panel")
