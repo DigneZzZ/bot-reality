@@ -6,6 +6,7 @@ import json
 from logging.handlers import RotatingFileHandler
 from redis_queue import get_redis
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from checker import run_check  # Импорт функции из checker.py
 from datetime import datetime
 from typing import Optional
@@ -44,6 +45,27 @@ bot = Bot(token=TOKEN, parse_mode="HTML")
 
 # Инициализация аналитики
 analytics_collector = None
+
+def get_domain_result_keyboard(domain: str, is_short: bool):
+    """Генерирует inline клавиатуру для результата проверки домена"""
+    buttons = []
+    if is_short:
+        buttons.append([InlineKeyboardButton(
+            text="📄 Полный отчет", 
+            callback_data=f"full_report:{domain}"
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(
+            text="📋 Краткий отчет", 
+            callback_data=f"short_report:{domain}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="🔄 Перепроверить", 
+        callback_data=f"recheck:{domain}:{int(is_short)}"
+    )])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def init_analytics():
     """Инициализирует аналитику"""
@@ -260,11 +282,9 @@ async def worker():
                             # Полный отчёт в группе
                             await send_group_reply(chat_id, message_id, thread_id, result)
                     else:
-                        # В ЛС отправляем как обычно
-                        final_message = result
-                        if short_mode:
-                            final_message += "\n\n💡 <i>Для полного отчета отправьте запрос повторно с параметром full.</i>"
-                        await bot.send_message(user_id, final_message)
+                        # В ЛС отправляем с inline кнопками
+                        keyboard = get_domain_result_keyboard(domain, is_short=short_mode)
+                        await bot.send_message(user_id, result, reply_markup=keyboard)
                 except Exception as e:
                     logging.error(f"Failed to send message to chat {chat_id} for {domain}: {str(e)}")
             except Exception as e:

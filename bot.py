@@ -14,6 +14,7 @@ from urllib.parse import urlparse, quote, unquote
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
+from localization import i18n, _
 
 # --- Conditional Imports ---
 try:
@@ -102,23 +103,101 @@ if not BOT_USERNAME:
 bot = Bot(token=TOKEN, parse_mode="HTML")
 router = Router()
 analytics_collector = None
+redis_pool = None  # Глобальный пул соединений Redis
 
-# --- Redis Connection ---
-async def get_redis_connection() -> redis.Redis:
+# --- Redis Connection Pool ---
+async def init_redis_pool():
+    """Инициализирует пул соединений Redis"""
+    global redis_pool
     try:
-        connection = redis.Redis(
+        redis_pool = redis.ConnectionPool(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6379")),
             password=os.getenv("REDIS_PASSWORD"),
             decode_responses=True,
+            max_connections=20,  # Максимум 20 соединений в пуле
             retry_on_timeout=True
         )
         # Проверяем соединение
-        await connection.ping()
-        return connection
+        test_conn = redis.Redis(connection_pool=redis_pool)
+        await test_conn.ping()
+        await test_conn.aclose()
+        logging.info("✅ Redis connection pool initialized successfully")
     except Exception as e:
-        logging.error(f"❌ Failed to connect to Redis: {e}")
+        logging.error(f"❌ Failed to initialize Redis pool: {e}")
         raise
+
+async def get_redis_connection() -> redis.Redis:
+    """Возвращает соединение из пула"""
+    try:
+        if redis_pool is None:
+            await init_redis_pool()
+        return redis.Redis(connection_pool=redis_pool)
+    except Exception as e:
+        logging.error(f"❌ Failed to get Redis connection from pool: {e}")
+        raise
+
+async def close_redis_pool():
+    """Закрывает пул соединений Redis"""
+    global redis_pool
+    if redis_pool:
+        try:
+            await redis_pool.disconnect()
+            logging.info("✅ Redis pool closed successfully")
+        except Exception as e:
+            logging.error(f"❌ Error closing Redis pool: {e}")
+
+# --- Language Management ---
+async def get_user_language(user_id: int) -> str:
+    """Получает язык пользователя из Redis или определяет автоматически"""
+    r = await get_redis_connection()
+    try:
+        lang = await r.get(f"user:lang:{user_id}")
+        if lang and i18n.is_supported(lang):
+            return lang
+        return i18n.default_lang
+    except Exception as e:
+        logging.error(f"Error getting user language: {e}")
+        return i18n.default_lang
+    finally:
+        try:
+            await r.aclose()
+        except:
+            pass
+
+async def set_user_language(user_id: int, lang: str):
+    """Сохраняет выбранный язык пользователя в Redis"""
+    if not i18n.is_supported(lang):
+        lang = i18n.default_lang
+    
+    r = await get_redis_connection()
+    try:
+        await r.set(f"user:lang:{user_id}", lang)
+        logging.info(f"User {user_id} language set to: {lang}")
+    except Exception as e:
+        logging.error(f"Error setting user language: {e}")
+    finally:
+        try:
+            await r.aclose()
+        except:
+            pass
+
+async def init_user_language(user: types.User) -> str:
+    """Инициализирует язык пользователя при первом запуске"""
+    user_id = user.id
+    current_lang = await get_user_language(user_id)
+    
+    # Если язык уже установлен, возвращаем его
+    if current_lang != i18n.default_lang:
+        return current_lang
+    
+    # Пытаемся определить из Telegram
+    if user.language_code:
+        detected_lang = i18n.normalize_language_code(user.language_code)
+        await set_user_language(user_id, detected_lang)
+        return detected_lang
+    
+    return i18n.default_lang
 
 # --- Analytics ---
 async def init_analytics():
@@ -163,6 +242,125 @@ def extract_domain(text: Optional[str]) -> Optional[str]:
         return text.lower()
     return None
 
+def is_valid_ipv4(ip_str: str) -> bool:
+    """Проверка, является ли строка валидным IPv4 адресом"""
+    if not isinstance(ip_str, str):
+        return False
+    
+    ip_str = ip_str.strip()
+    
+    # Проверка регулярным выражением
+    pattern = r'^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+    if not re.match(pattern, ip_str):
+        return False
+    
+    # Дополнительная проверка через модуль ipaddress
+    try:
+        import ipaddress
+        ip = ipaddress.IPv4Address(ip_str)
+        return True
+    except (ValueError, ipaddress.AddressValueError):
+        return False
+
+async def get_ip_info(ip_address: str, lang: str = 'ru') -> str:
+    """
+    Получение информации об IP адресе из GeoIP2 базы данных.
+    
+    Args:
+        ip_address: IPv4 адрес для проверки
+        lang: Язык вывода (ru/en)
+    
+    Returns:
+        Форматированная строка с информацией об IP адресе
+    """
+    try:
+        import geoip2.database
+        import geoip2.errors
+        
+        # Путь к базе данных GeoIP2
+        db_path = os.getenv("GEOIP2_DB_PATH", "GeoLite2-City.mmdb")
+        
+        if not os.path.exists(db_path):
+            return i18n.get('ip.database_not_found', lang)
+        
+        # Открываем базу данных и получаем информацию
+        with geoip2.database.Reader(db_path) as reader:
+            try:
+                response = reader.city(ip_address)
+                
+                # Формируем информацию
+                ip_emoji = "🌐"
+                country_emoji = "🌍"
+                city_emoji = "🏙️"
+                isp_emoji = "🔌"
+                coord_emoji = "📍"
+                
+                # Получаем название страны на нужном языке
+                country_names = response.country.names
+                if lang == 'ru' and 'ru' in country_names:
+                    country = country_names['ru']
+                elif lang == 'en' and 'en' in country_names:
+                    country = country_names['en']
+                else:
+                    country = country_names.get('en', i18n.get('ip.unknown', lang))
+                
+                # Получаем название города
+                city_names = response.city.names
+                if lang == 'ru' and 'ru' in city_names:
+                    city = city_names['ru']
+                elif lang == 'en' and 'en' in city_names:
+                    city = city_names['en']
+                else:
+                    city = city_names.get('en', i18n.get('ip.unknown', lang))
+                
+                # ISO код страны
+                country_iso = response.country.iso_code or i18n.get('ip.unknown', lang)
+                
+                # Координаты
+                lat = response.location.latitude
+                lon = response.location.longitude
+                
+                # Формируем ответ
+                lines = [
+                    i18n.get('ip.title', lang),
+                    "",
+                    f"{ip_emoji} {i18n.get('ip.address', lang)}: `{ip_address}`",
+                    f"{country_emoji} {i18n.get('ip.country', lang)}: {country} ({country_iso})",
+                ]
+                
+                if city:
+                    lines.append(f"{city_emoji} {i18n.get('ip.city', lang)}: {city}")
+                
+                # ISP/Organization (если доступно в базе)
+                # В City базе может не быть ISP, это есть в ASN базе
+                # Но попробуем получить
+                try:
+                    if hasattr(response, 'traits') and hasattr(response.traits, 'isp'):
+                        isp = response.traits.isp
+                        if isp:
+                            lines.append(f"{isp_emoji} {i18n.get('ip.provider', lang)}: {isp}")
+                except:
+                    pass
+                
+                # Координаты
+                if lat is not None and lon is not None:
+                    lines.append(f"{coord_emoji} {i18n.get('ip.coordinates', lang)}: {lat:.4f}, {lon:.4f}")
+                
+                return "\n".join(lines)
+                
+            except geoip2.errors.AddressNotFoundError:
+                return i18n.get('ip.not_found', lang, ip=ip_address)
+            except Exception as e:
+                logging.error(f"GeoIP2 lookup error for {ip_address}: {e}")
+                return i18n.get('ip.lookup_error', lang, error=str(e))
+                
+    except ImportError:
+        logging.error("geoip2 module not installed")
+        return i18n.get('ip.module_not_installed', lang)
+    except Exception as e:
+        logging.error(f"Unexpected error in get_ip_info: {e}")
+        return i18n.get('ip.unexpected_error', lang, error=str(e))
+
 # --- Message Handling ---
 async def send_topic_aware_message(message: Message, text: str, reply_markup=None) -> Optional[Message]:
     thread_id = message.message_thread_id if message.is_topic_message else None
@@ -205,6 +403,27 @@ def get_admin_keyboard():
         [InlineKeyboardButton(text="Аналитика", callback_data="analytics"), InlineKeyboardButton(text="Управление группами", callback_data="groups")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="start_menu")]
     ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_domain_result_keyboard(domain: str, is_short: bool):
+    """Генерирует клавиатуру для результата проверки домена"""
+    buttons = []
+    if is_short:
+        buttons.append([InlineKeyboardButton(
+            text="📄 Полный отчет", 
+            callback_data=f"full_report:{domain}"
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(
+            text="📋 Краткий отчет", 
+            callback_data=f"short_report:{domain}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="🔄 Перепроверить", 
+        callback_data=f"recheck:{domain}:{int(is_short)}"
+    )])
+    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- Limit Checks ---
@@ -287,7 +506,10 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
                     response_text = cached_result
                     if is_group and final_short_mode:
                         response_text += "\n\n💡 <i>Для полного отчета выполните повторный запрос в ЛС боту.</i>"
-                    await send_topic_aware_message(message, response_text)
+                    
+                    # Добавляем inline кнопки только для личных сообщений
+                    keyboard = get_domain_result_keyboard(domain, final_short_mode) if not is_group else None
+                    await send_topic_aware_message(message, response_text, reply_markup=keyboard)
                 else:
                     # Результата нет в кэше или нужен другой тип отчета
                     await enqueue(domain, user_id, final_short_mode, message.chat.id, message.message_id, message.message_thread_id)
@@ -312,6 +534,9 @@ async def cmd_start(message: Message, command: Optional[CommandObject] = None):
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
     
+    # Инициализируем язык пользователя
+    user_lang = await init_user_language(message.from_user)
+    
     if command and command.args:
         param = command.args
         try:
@@ -323,25 +548,29 @@ async def cmd_start(message: Message, command: Optional[CommandObject] = None):
         if decoded_param.startswith("full_"):
             domain = extract_domain(decoded_param[5:])
             if domain:
-                await send_topic_aware_message(message, f"📄 <b>Получаю полный отчет для {domain}...</b>")
+                msg = f"📄 <b>{_('messages.getting_full_report', lang=user_lang, domain=domain)}</b>" if i18n.is_supported(user_lang) else f"📄 <b>Получаю полный отчет для {domain}...</b>"
+                await send_topic_aware_message(message, msg)
                 await handle_domain_logic(message, domain, short_mode=False)
             else:
-                await send_topic_aware_message(message, f"❌ Некорректный домен в ссылке: {decoded_param[5:]}")
+                msg = f"❌ {_('messages.invalid_domain', lang=user_lang, domain=decoded_param[5:])}" if i18n.is_supported(user_lang) else f"❌ Некорректный домен в ссылке: {decoded_param[5:]}"
+                await send_topic_aware_message(message, msg)
         else:
             domain = extract_domain(decoded_param)
             if domain:
-                await send_topic_aware_message(message, f"🔍 <b>Получаю результат для {domain}...</b>")
+                msg = f"🔍 <b>{_('messages.getting_result', lang=user_lang, domain=domain)}</b>" if i18n.is_supported(user_lang) else f"🔍 <b>Получаю результат для {domain}...</b>"
+                await send_topic_aware_message(message, msg)
                 await handle_domain_logic(message, domain, short_mode=True)
             else:
-                await send_topic_aware_message(message, f"❌ Неизвестный параметр deep-link: {decoded_param}")
+                msg = f"❌ {_('messages.unknown_deeplink', lang=user_lang, param=decoded_param)}" if i18n.is_supported(user_lang) else f"❌ Неизвестный параметр deep-link: {decoded_param}"
+                await send_topic_aware_message(message, msg)
         return
 
-    welcome_message = (
-        "👋 <b>Привет!</b> Я бот для проверки доменов.\n\n"
-        "Отправь мне домен для проверки, например: <code>google.com</code>\n"
-        "Или несколько доменов через запятую/пробел/новую строку.\n\n"
-        "Используй /help для просмотра всех команд."
-    )
+    # Приветственное сообщение с локализацией
+    welcome_title = _("welcome.title", lang=user_lang)
+    welcome_desc = _("welcome.description", lang=user_lang)
+    welcome_help = _("welcome.help_hint", lang=user_lang)
+    welcome_message = f"{welcome_title}\n\n{welcome_desc}\n\n{welcome_help}"
+    
     await send_topic_aware_message(message, welcome_message, reply_markup=get_main_keyboard(is_admin))
 
 @router.message(Command("help"))
@@ -416,6 +645,82 @@ async def cmd_history(message: Message):
         await send_topic_aware_message(message, response)
     finally:
         await r.aclose()
+
+@router.message(Command("language", "lang"))
+async def cmd_language(message: Message):
+    """Команда для выбора языка интерфейса"""
+    if not message.from_user: return
+    
+    user_id = message.from_user.id
+    user_lang = await get_user_language(user_id)
+    
+    # Создаем inline клавиатуру с языками
+    buttons = []
+    row = []
+    for lang_code in i18n.supported_languages:
+        lang_name = i18n.get_language_name(lang_code, user_lang)
+        row.append(InlineKeyboardButton(
+            text=lang_name, 
+            callback_data=f"set_lang:{lang_code}"
+        ))
+        # По 2 кнопки в ряд
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    
+    # Добавляем оставшиеся кнопки
+    if row:
+        buttons.append(row)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    select_text = _("messages.select_language", lang=user_lang)
+    await send_topic_aware_message(message, select_text, reply_markup=keyboard)
+
+@router.message(Command("ip"))
+async def cmd_ip(message: Message):
+    """Команда для получения информации об IP адресе"""
+    if not message.from_user or not message.text: return
+    
+    user_id = message.from_user.id
+    user_lang = await get_user_language(user_id)
+    
+    # Парсим команду
+    parts = message.text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        # Если не указан IP адрес
+        usage_text = _("ip.usage", lang=user_lang)
+        await send_topic_aware_message(message, usage_text)
+        return
+    
+    ip_address = parts[1].strip()
+    
+    # Валидация IPv4 адреса
+    if not is_valid_ipv4(ip_address):
+        invalid_text = _("ip.invalid", lang=user_lang, ip=ip_address)
+        await send_topic_aware_message(message, invalid_text)
+        return
+    
+    # Отправляем сообщение о получении информации
+    processing_text = _("ip.processing", lang=user_lang, ip=ip_address)
+    status_msg = await send_topic_aware_message(message, processing_text)
+    
+    # Получаем информацию об IP
+    ip_info = await get_ip_info(ip_address, user_lang)
+    
+    # Отправляем результат
+    await send_topic_aware_message(message, ip_info)
+    
+    # Удаляем сообщение о статусе (если оно было отправлено)
+    if status_msg and not is_group_chat(message):
+        try:
+            await bot.delete_message(chat_id=status_msg.chat.id, message_id=status_msg.message_id)
+        except:
+            pass
+    
+    # Логируем аналитику
+    await log_analytics("ip_lookup", user_id, ip_address=ip_address)
 
 @router.message(Command("check", "full"))
 async def cmd_check(message: Message):
@@ -737,6 +1042,98 @@ async def cq_groups(call: CallbackQuery):
     await call.message.edit_text(status, reply_markup=get_admin_keyboard())
     await call.answer()
 
+# --- Domain Action Handlers ---
+@router.callback_query(F.data.startswith("full_report:"))
+async def cq_full_report(call: CallbackQuery):
+    """Обработчик запроса полного отчета"""
+    if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
+    
+    domain = call.data.split(":", 1)[1]
+    r = await get_redis_connection()
+    try:
+        cache_key = f"result:{domain}:full"
+        cached_result = await r.get(cache_key)
+        
+        if cached_result:
+            # Полный отчет найден в кэше
+            keyboard = get_domain_result_keyboard(domain, is_short=False)
+            await call.message.edit_text(cached_result, reply_markup=keyboard)
+        else:
+            # Нет в кэше, добавляем в очередь
+            await enqueue(domain, call.from_user.id, short_mode=False, chat_id=call.message.chat.id)
+            await call.message.edit_text(f"✅ Домен <b>{domain}</b> добавлен в очередь для полной проверки.")
+    finally:
+        await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data.startswith("short_report:"))
+async def cq_short_report(call: CallbackQuery):
+    """Обработчик запроса краткого отчета"""
+    if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
+    
+    domain = call.data.split(":", 1)[1]
+    r = await get_redis_connection()
+    try:
+        cache_key = f"result:{domain}:short"
+        cached_result = await r.get(cache_key)
+        
+        if cached_result:
+            # Краткий отчет найден в кэше
+            keyboard = get_domain_result_keyboard(domain, is_short=True)
+            await call.message.edit_text(cached_result, reply_markup=keyboard)
+        else:
+            # Нет в кэше, добавляем в очередь
+            await enqueue(domain, call.from_user.id, short_mode=True, chat_id=call.message.chat.id)
+            await call.message.edit_text(f"✅ Домен <b>{domain}</b> добавлен в очередь для краткой проверки.")
+    finally:
+        await r.aclose()
+    await call.answer()
+
+@router.callback_query(F.data.startswith("recheck:"))
+async def cq_recheck(call: CallbackQuery):
+    """Обработчик перепроверки домена"""
+    if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
+    
+    parts = call.data.split(":")
+    domain = parts[1]
+    is_short = bool(int(parts[2]))
+    
+    r = await get_redis_connection()
+    try:
+        # Удаляем из кэша для принудительной перепроверки
+        cache_mode = "short" if is_short else "full"
+        cache_key = f"result:{domain}:{cache_mode}"
+        await r.delete(cache_key)
+        
+        # Добавляем в очередь
+        await enqueue(domain, call.from_user.id, short_mode=is_short, chat_id=call.message.chat.id)
+        mode_text = "краткой" if is_short else "полной"
+        await call.message.edit_text(f"🔄 Домен <b>{domain}</b> добавлен в очередь для {mode_text} перепроверки.")
+    finally:
+        await r.aclose()
+    await call.answer("Запущена перепроверка!")
+
+# --- Language Selection Handler ---
+@router.callback_query(F.data.startswith("set_lang:"))
+async def cq_set_language(call: CallbackQuery):
+    """Обработчик выбора языка"""
+    if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
+    
+    lang_code = call.data.split(":", 1)[1]
+    user_id = call.from_user.id
+    
+    # Устанавливаем новый язык
+    await set_user_language(user_id, lang_code)
+    
+    # Получаем название языка на новом языке
+    lang_name = i18n.get_language_name(lang_code, lang_code)
+    
+    # Сообщение об успехе на новом языке
+    success_msg = _("messages.language_selected", lang=lang_code, language=lang_name)
+    
+    await call.message.edit_text(success_msg)
+    await call.answer()
+
 # --- Group Management ---
 @router.my_chat_member(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def on_group_join(update: types.ChatMemberUpdated):
@@ -758,28 +1155,58 @@ async def set_bot_commands():
         BotCommand(command="history", description="Показать историю запросов"),
         BotCommand(command="check", description="Краткая проверка домена"),
         BotCommand(command="full", description="Полная проверка домена"),
+        BotCommand(command="ip", description="Получить информацию об IP адресе"),
+        BotCommand(command="language", description="Сменить язык интерфейса"),
         BotCommand(command="admin", description="Панель администратора"),
     ]
     await bot.set_my_commands(commands)
+
+async def shutdown(dp: Dispatcher):
+    """Корректное завершение работы бота"""
+    logging.info("🛑 Shutting down gracefully...")
+    
+    # Останавливаем polling
+    await dp.stop_polling()
+    
+    # Закрываем Redis pool
+    await close_redis_pool()
+    
+    # Закрываем сессию бота
+    await bot.session.close()
+    
+    # Отменяем все активные задачи
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    
+    # Ожидаем завершения всех задач
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    logging.info("✅ Bot shutdown completed")
 
 async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    await init_analytics()
-    await set_bot_commands()
-
     try:
-        logging.info("Bot starting...")
+        # Инициализация
+        await init_redis_pool()
+        await init_analytics()
+        await set_bot_commands()
+        
+        logging.info("🚀 Bot starting...")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("⚠️ Received stop signal")
+    except Exception as e:
+        logging.error(f"❌ Critical error in main loop: {e}", exc_info=True)
     finally:
-        await bot.session.close()
-        logging.info("Bot stopped.")
+        await shutdown(dp)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Bot execution stopped by user.")
+        logging.info("👋 Bot execution stopped by user.")
     except Exception as e:
-        logging.error(f"Critical error in main loop: {e}", exc_info=True)
+        logging.error(f"❌ Critical error: {e}", exc_info=True)

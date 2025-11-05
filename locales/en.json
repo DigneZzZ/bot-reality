@@ -1,0 +1,108 @@
+{
+  "commands": {
+    "start": "Start working with the bot",
+    "help": "Show help",
+    "mode": "Switch output mode (full/short)",
+    "history": "Show request history",
+    "check": "Quick domain check",
+    "full": "Full domain check",
+    "admin": "Admin panel",
+    "language": "Change interface language",
+    "ip": "Get IP address information"
+  },
+  "welcome": {
+    "title": "👋 <b>Hello!</b> I'm a domain checking bot.",
+    "description": "Send me a domain to check, for example: <code>google.com</code>\nOr multiple domains separated by comma/space/new line.",
+    "help_hint": "Use /help to see all commands."
+  },
+  "help": {
+    "basic_title": "<b>Basic commands:</b>",
+    "group_title": "<b>Group commands:</b>",
+    "admin_title": "<b>Admin commands:</b>",
+    "prefix_info": "<i>💡 Command prefix: {prefix}</i>",
+    "output_mode": "<i>📊 Output mode: {mode}</i>"
+  },
+  "buttons": {
+    "mode_switch": "Switch full / short output",
+    "history": "Request history",
+    "admin_panel": "Admin panel",
+    "back": "⬅️ Back",
+    "full_report": "📄 Full report",
+    "short_report": "📋 Short report",
+    "recheck": "🔄 Recheck",
+    "reset_queue": "Reset queue",
+    "clear_cache": "Clear cache",
+    "approved_list": "Approved list",
+    "clear_approved": "Clear approved",
+    "export_approved": "Export approved",
+    "analytics": "Analytics",
+    "manage_groups": "Manage groups",
+    "select_language": "🌐 Select language"
+  },
+  "messages": {
+    "rate_limit": "🚫 Rate limit exceeded. Please try later.",
+    "no_domains": "❌ No valid domains found for checking.",
+    "domain_queued": "✅ Domain <b>{domain}</b> added to check queue.",
+    "mode_changed": "✅ Output mode changed to: <b>{mode}</b>",
+    "mode_private_only": "⛔ /mode command is only available in private messages. Groups use GROUP_OUTPUT_MODE setting.",
+    "history_empty": "📜 Your check history is empty.",
+    "history_title": "📜 <b>Your last 10 checks:</b>",
+    "history_private_only": "⛔ /history command is only available in private messages.",
+    "admin_only": "⛔ This command is only available to administrator.",
+    "admin_private_only": "⛔ Admin commands are only available in private messages.",
+    "provide_domain": "⛔ Specify domain, for example: {command} example.com",
+    "full_report_hint": "💡 <i>For full report, repeat request in bot's private messages.</i>",
+    "recheck_started": "Recheck started!",
+    "language_selected": "✅ Language changed to: <b>{language}</b>",
+    "select_language": "🌐 <b>Select interface language:</b>",
+    "getting_full_report": "Getting full report for {domain}...",
+    "getting_result": "Getting result for {domain}...",
+    "invalid_domain": "Invalid domain in link: {domain}",
+    "unknown_deeplink": "Unknown deep-link parameter: {param}"
+  },
+  "admin": {
+    "panel_title": "Welcome to admin panel.",
+    "queue_reset": "✅ Queue reset. Deleted tasks: {tasks}, pending keys: {pending}.",
+    "cache_cleared": "✅ Cache cleared. Deleted {count} entries.",
+    "cache_empty": "✅ Cache already empty.",
+    "approved_disabled": "⛔ Domain saving feature is disabled.",
+    "approved_empty": "📜 Approved domains list is empty.",
+    "approved_title": "📜 <b>Approved domains:</b>",
+    "approved_cleared": "✅ Approved domains list cleared.",
+    "approved_exported": "✅ File with approved domains sent.",
+    "export_error": "❌ Export error: {error}",
+    "analytics_unavailable": "❌ Analytics not initialized.",
+    "analytics_error": "❌ Report generation error: {error}",
+    "groups_open_mode": "🌐 <b>Authorization mode:</b> Open (any groups)",
+    "groups_restricted_mode": "🔒 <b>Authorization mode:</b> Restricted ({count} groups)",
+    "groups_authorized": "<b>Authorized groups:</b>",
+    "bot_joined_group": "✅ Bot added to new group: {title} (<code>{chat_id}</code>)"
+  },
+  "check_results": {
+    "full_report_queued": "✅ Domain <b>{domain}</b> added to queue for full check.",
+    "short_report_queued": "✅ Domain <b>{domain}</b> added to queue for short check.",
+    "recheck_queued": "🔄 Domain <b>{domain}</b> added to queue for {mode} recheck."
+  },
+  "languages": {
+    "ru": "🇷🇺 Russian",
+    "en": "🇬🇧 English",
+    "zh": "🇨🇳 Chinese"
+  },
+  "ip": {
+    "usage": "ℹ️ <b>Usage:</b> /ip <code>IP-address</code>\n\n<b>Example:</b> /ip 8.8.8.8",
+    "invalid": "❌ Invalid IP address: <code>{ip}</code>\n\nPlease specify a valid IPv4 address.",
+    "processing": "🔍 Getting information about IP address <code>{ip}</code>...",
+    "title": "🌐 <b>IP Address Information</b>",
+    "address": "IP address",
+    "country": "Country",
+    "city": "City",
+    "provider": "Provider",
+    "coordinates": "Coordinates",
+    "unknown": "Unknown",
+    "not_found": "❌ Information about IP address <code>{ip}</code> not found in database.",
+    "database_not_found": "❌ GeoIP2 database not found. Please download GeoLite2-City.mmdb",
+    "lookup_error": "❌ Error getting information: {error}",
+    "module_not_installed": "❌ geoip2 module is not installed.",
+    "unexpected_error": "❌ Unexpected error: {error}"
+  }
+}
