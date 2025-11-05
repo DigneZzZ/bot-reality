@@ -257,6 +257,7 @@ async def worker():
                     chat_id = task_data.get('chat_id', user_id)
                     message_id = task_data.get('message_id')
                     thread_id = task_data.get('thread_id')
+                    lang = task_data.get('lang', 'ru')  # Получаем язык пользователя
                 except (json.JSONDecodeError, KeyError):
                     # Fallback к старому формату
                     domain, user_id, short_mode = task.split(":")
@@ -265,7 +266,9 @@ async def worker():
                     chat_id = user_id
                     message_id = None
                     thread_id = None
+                    lang = 'ru'  # По умолчанию русский для старого формата
                 
+                # TODO: В будущем передавать lang в check_domain для локализации результатов проверки
                 result = await check_domain(domain, user_id, short_mode)
                 
                 try:

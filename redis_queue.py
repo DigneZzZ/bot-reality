@@ -73,7 +73,7 @@ async def is_domain_in_queue(domain: str, user_id: int) -> bool:
         except Exception as e:
             logging.warning(f"⚠️ Error closing Redis connection: {e}")
 
-async def enqueue(domain: str, user_id: int, short_mode: bool, chat_id: Optional[int] = None, message_id: Optional[int] = None, thread_id: Optional[int] = None):
+async def enqueue(domain: str, user_id: int, short_mode: bool, chat_id: Optional[int] = None, message_id: Optional[int] = None, thread_id: Optional[int] = None, lang: str = 'ru'):
     r = await get_redis()
     try:
         pending_key = f"pending:{domain}:{user_id}"
@@ -81,14 +81,15 @@ async def enqueue(domain: str, user_id: int, short_mode: bool, chat_id: Optional
             logging.info(f"Domain {domain} for user {user_id} already in queue, skipping")
             return False
         
-        # Создаём расширенный task с контекстом чата
+        # Создаём расширенный task с контекстом чата и языком
         task_data = {
             'domain': domain,
             'user_id': user_id,
             'short_mode': short_mode,
             'chat_id': chat_id or user_id,  # Если chat_id не указан, используем user_id (ЛС)
             'message_id': message_id,
-            'thread_id': thread_id
+            'thread_id': thread_id,
+            'lang': lang  # Добавляем язык пользователя
         }
         
         # Сериализуем в JSON для хранения в Redis

@@ -664,6 +664,9 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
     user_id = message.from_user.id
     is_group = is_group_chat(message)
     chat_id = message.chat.id if is_group else None
+    
+    # Получаем язык пользователя
+    user_lang = await get_user_language(user_id)
 
     if not await check_limits(user_id, is_group, chat_id):
         await send_topic_aware_message(message, "🚫 Превышен лимит запросов. Попробуйте позже.")
@@ -704,8 +707,9 @@ async def handle_domain_logic(message: Message, text: str, short_mode: bool):
                     await send_topic_aware_message(message, response_text, reply_markup=keyboard)
                 else:
                     # Результата нет в кэше или нужен другой тип отчета
-                    await enqueue(domain, user_id, final_short_mode, message.chat.id, message.message_id, message.message_thread_id)
-                    await send_topic_aware_message(message, f"✅ Домен <b>{domain}</b> добавлен в очередь на проверку.")
+                    await enqueue(domain, user_id, final_short_mode, message.chat.id, message.message_id, message.message_thread_id, lang=user_lang)
+                    queued_msg = _('messages.domain_queued', lang=user_lang, domain=domain) if i18n.is_supported(user_lang) else f"✅ Домен <b>{domain}</b> добавлен в очередь на проверку."
+                    await send_topic_aware_message(message, queued_msg)
                 await log_analytics("domain_check", user_id, domain=domain, mode="short" if final_short_mode else "full")
             except Exception as e:
                 logging.error(f"Error processing domain {domain}: {e}")
@@ -1244,6 +1248,8 @@ async def cq_full_report(call: CallbackQuery):
     """Обработчик запроса полного отчета"""
     if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
     
+    user_id = call.from_user.id
+    user_lang = await get_user_language(user_id)
     domain = call.data.split(":", 1)[1]
     r = await get_redis_connection()
     try:
@@ -1256,7 +1262,7 @@ async def cq_full_report(call: CallbackQuery):
             await call.message.edit_text(cached_result, reply_markup=keyboard)
         else:
             # Нет в кэше, добавляем в очередь
-            await enqueue(domain, call.from_user.id, short_mode=False, chat_id=call.message.chat.id)
+            await enqueue(domain, user_id, short_mode=False, chat_id=call.message.chat.id, lang=user_lang)
             await call.message.edit_text(f"✅ Домен <b>{domain}</b> добавлен в очередь для полной проверки.")
     finally:
         await r.aclose()
@@ -1267,6 +1273,8 @@ async def cq_short_report(call: CallbackQuery):
     """Обработчик запроса краткого отчета"""
     if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
     
+    user_id = call.from_user.id
+    user_lang = await get_user_language(user_id)
     domain = call.data.split(":", 1)[1]
     r = await get_redis_connection()
     try:
@@ -1279,7 +1287,7 @@ async def cq_short_report(call: CallbackQuery):
             await call.message.edit_text(cached_result, reply_markup=keyboard)
         else:
             # Нет в кэше, добавляем в очередь
-            await enqueue(domain, call.from_user.id, short_mode=True, chat_id=call.message.chat.id)
+            await enqueue(domain, user_id, short_mode=True, chat_id=call.message.chat.id, lang=user_lang)
             await call.message.edit_text(f"✅ Домен <b>{domain}</b> добавлен в очередь для краткой проверки.")
     finally:
         await r.aclose()
@@ -1290,6 +1298,8 @@ async def cq_recheck(call: CallbackQuery):
     """Обработчик перепроверки домена"""
     if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
     
+    user_id = call.from_user.id
+    user_lang = await get_user_language(user_id)
     parts = call.data.split(":")
     domain = parts[1]
     is_short = bool(int(parts[2]))
@@ -1302,7 +1312,7 @@ async def cq_recheck(call: CallbackQuery):
         await r.delete(cache_key)
         
         # Добавляем в очередь
-        await enqueue(domain, call.from_user.id, short_mode=is_short, chat_id=call.message.chat.id)
+        await enqueue(domain, user_id, short_mode=is_short, chat_id=call.message.chat.id, lang=user_lang)
         mode_text = "краткой" if is_short else "полной"
         await call.message.edit_text(f"🔄 Домен <b>{domain}</b> добавлен в очередь для {mode_text} перепроверки.")
     finally:
