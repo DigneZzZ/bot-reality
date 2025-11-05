@@ -23,8 +23,10 @@
     "output_mode": "<i>📊 Output mode: {mode}</i>"
   },
   "buttons": {
+    "mode": "Switch full / short output",
     "mode_switch": "Switch full / short output",
     "history": "Request history",
+    "language": "🌐 Select language",
     "admin_panel": "Admin panel",
     "back": "⬅️ Back",
     "full_report": "📄 Full report",

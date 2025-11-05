@@ -169,8 +169,8 @@ class AnalyticsCollector:
             "last_activity": last_activity
         }
     
-    async def generate_analytics_report(self, admin_id: int) -> str:
-        """Генерирует текстовый отчет для администратора"""
+    async def generate_analytics_report(self) -> str:
+        """Генерирует текстовый отчет для администратора со статистикой ВСЕХ пользователей"""
         summary = await self.get_analytics_summary(days=7)
         
         report = "📊 <b>Аналитика бота (7 дней)</b>\n\n"

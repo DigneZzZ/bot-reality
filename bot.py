@@ -50,7 +50,7 @@ class AnalyticsCollector:
     
     async def generate_analytics_report(self, *args, **kwargs):
         if self._real_collector:
-            return await self._real_collector.generate_analytics_report(*args, **kwargs)
+            return await self._real_collector.generate_analytics_report()
         return "Аналитика недоступна."
 
 # --- Logging Setup ---
@@ -386,20 +386,20 @@ async def delete_message_after_delay(chat_id: int, message_id: int, delay: int =
         pass
 
 # --- Keyboards ---
-def get_main_keyboard(is_admin: bool):
+def get_main_keyboard(is_admin: bool, lang: str = 'ru'):
     buttons = [
-        [InlineKeyboardButton(text="Смена вывода full / short", callback_data="mode")],
-        [InlineKeyboardButton(text="История запросов", callback_data="history")]
+        [InlineKeyboardButton(text=_("buttons.mode", lang=lang), callback_data="mode")],
+        [InlineKeyboardButton(text=_("buttons.history", lang=lang), callback_data="history")],
+        [InlineKeyboardButton(text=_("buttons.language", lang=lang), callback_data="change_language")]
     ]
     if is_admin:
-        buttons.append([InlineKeyboardButton(text="Админ-панель", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton(text=_("buttons.admin_panel", lang=lang), callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_admin_keyboard():
     buttons = [
         [InlineKeyboardButton(text="Сбросить очередь", callback_data="reset_queue"), InlineKeyboardButton(text="Очистить кэш", callback_data="clearcache")],
-        [InlineKeyboardButton(text="Список пригодных", callback_data="approved"), InlineKeyboardButton(text="Очистить пригодные", callback_data="clear_approved")],
-        [InlineKeyboardButton(text="Экспорт пригодных", callback_data="export_approved")],
+        [InlineKeyboardButton(text="Экспорт пригодных", callback_data="export_approved"), InlineKeyboardButton(text="Очистить пригодные", callback_data="clear_approved")],
         [InlineKeyboardButton(text="Аналитика", callback_data="analytics"), InlineKeyboardButton(text="Управление группами", callback_data="groups")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="start_menu")]
     ]
@@ -571,7 +571,7 @@ async def cmd_start(message: Message, command: Optional[CommandObject] = None):
     welcome_help = _("welcome.help_hint", lang=user_lang)
     welcome_message = f"{welcome_title}\n\n{welcome_desc}\n\n{welcome_help}"
     
-    await send_topic_aware_message(message, welcome_message, reply_markup=get_main_keyboard(is_admin))
+    await send_topic_aware_message(message, welcome_message, reply_markup=get_main_keyboard(is_admin, user_lang))
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -779,23 +779,6 @@ async def admin_panel_command(message: Message):
     if not await is_admin_check(message): return
     await send_topic_aware_message(message, "Добро пожаловать в админ-панель.", reply_markup=get_admin_keyboard())
 
-@router.message(Command("approved"))
-async def cmd_approved(message: types.Message):
-    if not await is_admin_check(message): return
-    if not SAVE_APPROVED_DOMAINS:
-        await message.reply("⛔ Функция сохранения доменов отключена.")
-        return
-    r = await get_redis_connection()
-    try:
-        domains = await r.smembers("approved_domains")
-        if not domains:
-            await message.reply("📜 Список пригодных доменов пуст.")
-            return
-        response = "📜 <b>Пригодные домены:</b>\n" + "\n".join(f"{i}. {d}" for i, d in enumerate(sorted(domains), 1))
-        await message.reply(response)
-    finally:
-        await r.aclose()
-
 @router.message(Command("clear_approved"))
 async def cmd_clear_approved(message: types.Message):
     if not await is_admin_check(message): return
@@ -862,7 +845,7 @@ async def analytics_command(message: types.Message):
         await message.reply("❌ Аналитика не инициализирована.")
         return
     try:
-        report = await analytics_collector.generate_analytics_report(message.from_user.id)
+        report = await analytics_collector.generate_analytics_report()
         await message.reply(report)
     except Exception as e:
         await message.reply(f"❌ Ошибка генерации отчета: {e}")
@@ -884,12 +867,16 @@ async def groups_command(message: types.Message):
 async def cq_start_menu(call: CallbackQuery):
     if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
     is_admin = call.from_user.id == ADMIN_ID
+    user_lang = await get_user_language(call.from_user.id)
+    
+    welcome_title = _("welcome.title", lang=user_lang)
+    welcome_desc = _("welcome.description", lang=user_lang)
+    welcome_help = _("welcome.help_hint", lang=user_lang)
+    welcome_message = f"{welcome_title}\n\n{welcome_desc}\n\n{welcome_help}"
+    
     await call.message.edit_text(
-        "👋 <b>Привет!</b> Я бот для проверки доменов.\n\n"
-        "Отправь мне домен для проверки, например: <code>google.com</code>\n"
-        "Или несколько доменов через запятую/пробел/новую строку.\n\n"
-        "Используй /help для просмотра всех команд.",
-        reply_markup=get_main_keyboard(is_admin)
+        welcome_message,
+        reply_markup=get_main_keyboard(is_admin, user_lang)
     )
     await call.answer()
 
@@ -959,25 +946,6 @@ async def cq_clearcache(call: CallbackQuery):
         await r.aclose()
     await call.answer()
 
-@router.callback_query(F.data == "approved")
-async def cq_approved(call: CallbackQuery):
-    if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
-    if not SAVE_APPROVED_DOMAINS:
-        await call.message.edit_text("⛔ Функция сохранения доменов отключена.", reply_markup=get_admin_keyboard())
-        await call.answer()
-        return
-    r = await get_redis_connection()
-    try:
-        domains = await r.smembers("approved_domains")
-        if not domains:
-            await call.message.edit_text("📜 Список пригодных доменов пуст.", reply_markup=get_admin_keyboard())
-        else:
-            response = "📜 <b>Пригодные домены:</b>\n" + "\n".join(f"{i}. {d}" for i, d in enumerate(sorted(domains), 1))
-            await call.message.edit_text(response, reply_markup=get_admin_keyboard())
-    finally:
-        await r.aclose()
-    await call.answer()
-
 @router.callback_query(F.data == "clear_approved")
 async def cq_clear_approved(call: CallbackQuery):
     if not call.message or not isinstance(call.message, types.Message) or not await is_admin_check(call): return
@@ -1023,7 +991,7 @@ async def cq_analytics(call: CallbackQuery):
         await call.answer()
         return
     try:
-        report = await analytics_collector.generate_analytics_report(call.from_user.id)
+        report = await analytics_collector.generate_analytics_report()
         await call.message.edit_text(report, reply_markup=get_admin_keyboard())
     except Exception as e:
         await call.message.edit_text(f"❌ Ошибка генерации отчета: {e}", reply_markup=get_admin_keyboard())
@@ -1114,6 +1082,44 @@ async def cq_recheck(call: CallbackQuery):
     await call.answer("Запущена перепроверка!")
 
 # --- Language Selection Handler ---
+@router.callback_query(F.data == "change_language")
+async def cq_change_language(call: CallbackQuery):
+    """Обработчик кнопки смены языка из главного меню"""
+    if not call.message or not isinstance(call.message, types.Message) or not call.from_user: return
+    
+    user_id = call.from_user.id
+    user_lang = await get_user_language(user_id)
+    
+    # Создаем inline клавиатуру с языками
+    buttons = []
+    row = []
+    for lang_code in i18n.supported_languages:
+        lang_name = i18n.get_language_name(lang_code, user_lang)
+        # Добавляем галочку для текущего языка
+        if lang_code == user_lang:
+            lang_name = f"✅ {lang_name}"
+        row.append(InlineKeyboardButton(
+            text=lang_name, 
+            callback_data=f"set_lang:{lang_code}"
+        ))
+        # По 2 кнопки в ряд
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    
+    # Добавляем оставшиеся кнопки
+    if row:
+        buttons.append(row)
+    
+    # Добавляем кнопку "Назад"
+    buttons.append([InlineKeyboardButton(text=_("buttons.back", lang=user_lang), callback_data="start_menu")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    select_text = _("messages.select_language", lang=user_lang)
+    await call.message.edit_text(select_text, reply_markup=keyboard)
+    await call.answer()
+
 @router.callback_query(F.data.startswith("set_lang:"))
 async def cq_set_language(call: CallbackQuery):
     """Обработчик выбора языка"""
@@ -1131,7 +1137,14 @@ async def cq_set_language(call: CallbackQuery):
     # Сообщение об успехе на новом языке
     success_msg = _("messages.language_selected", lang=lang_code, language=lang_name)
     
-    await call.message.edit_text(success_msg)
+    # Показываем главное меню на новом языке
+    is_admin = user_id == ADMIN_ID
+    welcome_title = _("welcome.title", lang=lang_code)
+    welcome_desc = _("welcome.description", lang=lang_code)
+    welcome_help = _("welcome.help_hint", lang=lang_code)
+    welcome_message = f"{welcome_title}\n\n{welcome_desc}\n\n{welcome_help}\n\n✅ {success_msg}"
+    
+    await call.message.edit_text(welcome_message, reply_markup=get_main_keyboard(is_admin, lang_code))
     await call.answer()
 
 # --- Group Management ---
